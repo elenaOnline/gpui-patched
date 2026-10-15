@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:02:31 -0700
+Subject: [PATCH] gpui: Treat file drops as mouse input
+
+A file dragged in from another application reaches the window only as
+FileDropEvents (dispatched as mouse moves and a mouse up); no real mouse
+move arrives during the drag. The input modality was left at Keyboard
+after any key press, so Hitbox::is_hovered was false for the whole drag
+and on_drop never fired until the user moved the mouse over the window
+before dragging. Set the modality to Mouse for FileDrop events.
+---
+ crates/gpui/src/window.rs | 60 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 645f9db..a6d926b 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -5414,7 +5414,10 @@ impl Window {
+         let old_modality = self.last_input_modality;
+         self.last_input_modality = match &event {
+             PlatformInput::KeyDown(_) => InputModality::Keyboard,
+-            PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
++            // A file drag is a mouse gesture: it is dispatched as mouse moves and a mouse up.
++            PlatformInput::MouseMove(_)
++            | PlatformInput::MouseDown(_)
++            | PlatformInput::FileDrop(_) => InputModality::Mouse,
+             PlatformInput::Touch(_) => InputModality::Touch,
+             _ => self.last_input_modality,
+         };
+@@ -8186,6 +8189,61 @@ mod tests {
+         }
+     }
+ 
++    struct FileDropTargetView(Rc<RefCell<Vec<PathBuf>>>);
++
++    impl Render for FileDropTargetView {
++        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
++            div().size_full().on_drop({
++                let observed_drops = self.0.clone();
++                move |paths: &ExternalPaths, _, _| {
++                    observed_drops
++                        .borrow_mut()
++                        .extend(paths.paths().iter().cloned())
++                }
++            })
++        }
++    }
++
++    /// A drag from another application never produces a real mouse move in the window, so the
++    /// file drop events themselves must restore mouse modality after a key press, or `on_drop`
++    /// sees its hitbox as not hovered.
++    #[gpui::test]
++    fn test_file_drop_after_key_press_reaches_on_drop(cx: &mut TestAppContext) {
++        let observed_drops = Rc::new(RefCell::new(Vec::new()));
++        let window: AnyWindowHandle = cx
++            .add_window({
++                let observed_drops = observed_drops.clone();
++                move |_, _| FileDropTargetView(observed_drops)
++            })
++            .into();
++        let path = PathBuf::from("/tmp/dropped-after-key-press");
++        let position = point(px(30.), px(30.));
++        let update_result = cx.update_window(window, |_, window, cx| {
++            window.draw(cx).clear(cx);
++            window.dispatch_event(
++                PlatformInput::KeyDown(KeyDownEvent {
++                    keystroke: Keystroke::parse("a").expect("valid keystroke"),
++                    is_held: false,
++                    prefer_character_input: false,
++                }),
++                cx,
++            );
++            assert!(window.last_input_was_keyboard());
++            window.dispatch_event(
++                FileDropEvent::Entered {
++                    position,
++                    paths: ExternalPaths([path.clone()].into_iter().collect()),
++                }
++                .to_platform_input(),
++                cx,
++            );
++            assert!(!window.last_input_was_keyboard());
++            window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
++        });
++        assert!(update_result.is_ok(), "{update_result:?}");
++        assert_eq!(observed_drops.borrow().as_slice(), [path]);
++    }
++
+     impl Render for FileDragView {
+         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+             div()

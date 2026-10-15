@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 06:21:27 -0700
+Subject: [PATCH] gpui: Pass an input method's clause underlines with its
+ marked text
+
+A composition in an input method (Japanese, Chinese, Korean) is shown in
+clauses: every text view underlines each clause, thick under the one being
+converted and thin under the others, so the user sees which part the next
+conversion applies to. GPUI's macOS view took only the marked text's
+string and said it read no marked text attributes, so a GPUI text input
+could only draw one underline under all of it.
+
+The view now asks for the underline and clause attributes
+(`validAttributesForMarkedText`) and reads the underlines as browsers do:
+one per run of `NSUnderlineStyleAttributeName`, thick when the style is
+above single, in the run's `NSUnderlineColorAttributeName` if it has one.
+An attribute value of another type than the attribute's (a style that is
+no number, a colour that is no `NSColor`) is left alone: a message it does
+not answer would raise an Objective-C exception, which cannot unwind out
+of the view's `setMarkedText:` and would abort. The underlines reach the
+input handler as `MarkedTextUnderline`s through
+`InputHandler::replace_and_mark_text_with_underlines` (and the same on
+`EntityInputHandler`), whose default ignores them and calls
+`replace_and_mark_text_in_range`, so existing handlers are unchanged.
+`gpui_macos::marked_text_underlines` is public for text views that read
+attributed marked text themselves (and for tests).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/input.rs            |  39 +++++++++-
+ crates/gpui/src/platform.rs         |  55 +++++++++++++++
+ crates/gpui_macos/src/gpui_macos.rs |   1 +
+ crates/gpui_macos/src/window.rs     | 106 ++++++++++++++++++++++++++--
+ 4 files changed, 194 insertions(+), 7 deletions(-)
+
+diff --git a/crates/gpui/src/input.rs b/crates/gpui/src/input.rs
+index 4167aa0..392302c 100644
+--- a/crates/gpui/src/input.rs
++++ b/crates/gpui/src/input.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+-    App, Bounds, ClipboardItem, Context, Entity, InputHandler, Pixels, TextInputConfiguration,
+-    UTF16Selection, Window,
++    App, Bounds, ClipboardItem, Context, Entity, InputHandler, MarkedTextUnderline, Pixels,
++    TextInputConfiguration, UTF16Selection, Window,
+ };
+ use std::ops::Range;
+ 
+@@ -64,6 +64,20 @@ pub trait EntityInputHandler: 'static + Sized {
+         cx: &mut Context<Self>,
+     );
+ 
++    /// See [`InputHandler::replace_and_mark_text_with_underlines`] for details
++    fn replace_and_mark_text_with_underlines(
++        &mut self,
++        range: Option<Range<usize>>,
++        new_text: &str,
++        new_selected_range: Option<Range<usize>>,
++        underlines: &[MarkedTextUnderline],
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        let _ = underlines;
++        self.replace_and_mark_text_in_range(range, new_text, new_selected_range, window, cx)
++    }
++
+     /// See [`InputHandler::bounds_for_range`] for details
+     fn bounds_for_range(
+         &mut self,
+@@ -202,6 +216,27 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
+         });
+     }
+ 
++    fn replace_and_mark_text_with_underlines(
++        &mut self,
++        range_utf16: Option<Range<usize>>,
++        new_text: &str,
++        new_selected_range: Option<Range<usize>>,
++        underlines: &[MarkedTextUnderline],
++        window: &mut Window,
++        cx: &mut App,
++    ) {
++        self.view.update(cx, |view, cx| {
++            view.replace_and_mark_text_with_underlines(
++                range_utf16,
++                new_text,
++                new_selected_range,
++                underlines,
++                window,
++                cx,
++            )
++        });
++    }
++
+     fn unmark_text(&mut self, window: &mut Window, cx: &mut App) {
+         self.view
+             .update(cx, |view, cx| view.unmark_text(window, cx));
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 3753f48..06d5687 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1913,6 +1913,29 @@ impl PlatformInputHandler {
+             .ok();
+     }
+ 
++    /// See [`InputHandler::replace_and_mark_text_with_underlines`].
++    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
++    pub fn replace_and_mark_text_with_underlines(
++        &mut self,
++        range_utf16: Option<Range<usize>>,
++        new_text: &str,
++        new_selected_range: Option<Range<usize>>,
++        underlines: &[MarkedTextUnderline],
++    ) {
++        self.cx
++            .update(|window, cx| {
++                self.handler.replace_and_mark_text_with_underlines(
++                    range_utf16,
++                    new_text,
++                    new_selected_range,
++                    underlines,
++                    window,
++                    cx,
++                )
++            })
++            .ok();
++    }
++
+     #[cfg_attr(target_os = "windows", allow(dead_code))]
+     pub fn unmark_text(&mut self) {
+         self.cx
+@@ -2084,6 +2107,21 @@ pub struct UTF16Selection {
+     pub reversed: bool,
+ }
+ 
++/// An underline an input method puts under part of its marked text: the
++/// clauses of a composition, the one being converted drawn thick (on macOS,
++/// the `NSUnderlineStyleAttributeName` runs of the marked text, read as
++/// browsers read them: a style above single is thick).
++#[derive(Clone, Debug, PartialEq)]
++pub struct MarkedTextUnderline {
++    /// The part of the marked text it is under, in UTF-16 code units from
++    /// the start of the marked text.
++    pub range: Range<usize>,
++    /// Thick (the clause being converted) rather than thin.
++    pub thick: bool,
++    /// The colour the input method asks for, if it asks for one.
++    pub color: Option<crate::Rgba>,
++}
++
+ /// Zed's interface for handling text input from the platform's IME system
+ /// This is currently a 1:1 exposure of the NSTextInputClient API:
+ ///
+@@ -2145,6 +2183,23 @@ pub trait InputHandler: 'static {
+         cx: &mut App,
+     );
+ 
++    /// [`Self::replace_and_mark_text_in_range`], with the input method's
++    /// underlines for the new marked text (its clauses, see
++    /// [`MarkedTextUnderline`]; empty when it gave none). The default
++    /// ignores them.
++    fn replace_and_mark_text_with_underlines(
++        &mut self,
++        range_utf16: Option<Range<usize>>,
++        new_text: &str,
++        new_selected_range: Option<Range<usize>>,
++        underlines: &[MarkedTextUnderline],
++        window: &mut Window,
++        cx: &mut App,
++    ) {
++        let _ = underlines;
++        self.replace_and_mark_text_in_range(range_utf16, new_text, new_selected_range, window, cx)
++    }
++
+     /// Remove the IME 'composing' state from the document
+     /// Corresponds to [unmarkText()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438239-unmarktext)
+     fn unmark_text(&mut self, window: &mut Window, cx: &mut App);
+diff --git a/crates/gpui_macos/src/gpui_macos.rs b/crates/gpui_macos/src/gpui_macos.rs
+index 1e393e4..1586154 100644
+--- a/crates/gpui_macos/src/gpui_macos.rs
++++ b/crates/gpui_macos/src/gpui_macos.rs
+@@ -56,6 +56,7 @@ pub(crate) use window::*;
+ pub(crate) use text_system::*;
+ 
+ pub use platform::MacPlatform;
++pub use window::marked_text_underlines;
+ 
+ trait BoolExt {
+     fn to_objc(self) -> BOOL;
+diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+index 829cc4f..de6e4d7 100644
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -3442,8 +3442,99 @@ extern "C" fn step(view: *mut c_void) {
+     }
+ }
+ 
++/// The marked text attributes the view reads: the underlines of an input
++/// method's clauses (see [`marked_text_underlines`]).
+ extern "C" fn valid_attributes_for_marked_text(_: &Object, _: Sel) -> id {
+-    unsafe { msg_send![class!(NSArray), array] }
++    unsafe {
++        let names = [
++            ns_string(UNDERLINE_STYLE_ATTRIBUTE),
++            ns_string(UNDERLINE_COLOR_ATTRIBUTE),
++            ns_string(MARKED_CLAUSE_SEGMENT_ATTRIBUTE),
++        ];
++        msg_send![class!(NSArray), arrayWithObjects: names.as_ptr() count: names.len()]
++    }
++}
++
++/// `NSUnderlineStyleAttributeName`, `NSUnderlineColorAttributeName` and
++/// `NSMarkedClauseSegmentAttributeName`.
++const UNDERLINE_STYLE_ATTRIBUTE: &str = "NSUnderline";
++const UNDERLINE_COLOR_ATTRIBUTE: &str = "NSUnderlineColor";
++const MARKED_CLAUSE_SEGMENT_ATTRIBUTE: &str = "NSMarkedClauseSegment";
++
++/// The underlines of an input method's marked text (an `NSAttributedString`),
++/// as browsers read them: one per run of `NSUnderlineStyleAttributeName`
++/// (each clause of a composition is a run), thick when the style is above
++/// single (the clause being converted), in the run's
++/// `NSUnderlineColorAttributeName` if it has one.
++///
++/// # Safety
++///
++/// `string` is an `NSAttributedString`.
++pub unsafe fn marked_text_underlines(string: id) -> Vec<gpui::MarkedTextUnderline> {
++    let mut underlines = Vec::new();
++    unsafe {
++        let length: NSUInteger = msg_send![string, length];
++        let mut index: NSUInteger = 0;
++        while index < length {
++            let mut run = NSRange::invalid();
++            let attributes: id = msg_send![
++                string,
++                attributesAtIndex: index
++                longestEffectiveRange: &mut run as *mut NSRange as *mut c_void
++                inRange: NSRange::from(index as usize..length as usize)
++            ];
++            let Some(range) = run.to_range().filter(|r| !r.is_empty()) else {
++                break;
++            };
++            let style: id = msg_send![attributes, objectForKey: ns_string(UNDERLINE_STYLE_ATTRIBUTE)];
++            // (the input method's values are only read when they are of the
++            // attribute's type: a message they do not answer would raise an
++            // Objective-C exception, which cannot unwind through this call)
++            if is_kind_of(style, class!(NSNumber)) {
++                let style: NSInteger = msg_send![style, integerValue];
++                let color: id =
++                    msg_send![attributes, objectForKey: ns_string(UNDERLINE_COLOR_ATTRIBUTE)];
++                underlines.push(gpui::MarkedTextUnderline {
++                    range: range.clone(),
++                    thick: style > 1,
++                    color: rgba_of(color),
++                });
++            }
++            index = range.end as NSUInteger;
++        }
++    }
++    underlines
++}
++
++/// Whether `object` is an instance of `class` (or a subclass).
++unsafe fn is_kind_of(object: id, class: &Class) -> bool {
++    if object == nil {
++        return false;
++    }
++    let is: BOOL = unsafe { msg_send![object, isKindOfClass: class] };
++    is == YES
++}
++
++/// An `NSColor` in sRGB, if it is one that converts.
++unsafe fn rgba_of(color: id) -> Option<gpui::Rgba> {
++    if !unsafe { is_kind_of(color, class!(NSColor)) } {
++        return None;
++    }
++    unsafe {
++        let srgb: id = msg_send![class!(NSColorSpace), sRGBColorSpace];
++        let color: id = msg_send![color, colorUsingColorSpace: srgb];
++        if color == nil {
++            return None;
++        }
++        let (mut r, mut g, mut b, mut a): (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.0);
++        let _: () = msg_send![color, getRed: &mut r green: &mut g blue: &mut b alpha: &mut a];
++        Some(gpui::Rgba {
++            r: r as f32,
++            g: g as f32,
++            b: b as f32,
++            a: a as f32,
++        })
++    }
+ }
+ 
+ extern "C" fn has_marked_text(this: &Object, _: Sel) -> BOOL {
+@@ -3541,16 +3632,21 @@ extern "C" fn set_marked_text(
+     unsafe {
+         let is_attributed_string: BOOL =
+             msg_send![text, isKindOfClass: [class!(NSAttributedString)]];
+-        let text: id = if is_attributed_string == YES {
+-            msg_send![text, string]
++        let (text, underlines): (id, _) = if is_attributed_string == YES {
++            (msg_send![text, string], marked_text_underlines(text))
+         } else {
+-            text
++            (text, Vec::new())
+         };
+         let selected_range = selected_range.to_range();
+         let replacement_range = replacement_range.to_range();
+         let text = text.to_str();
+         with_input_handler(this, |input_handler| {
+-            input_handler.replace_and_mark_text_in_range(replacement_range, text, selected_range)
++            input_handler.replace_and_mark_text_with_underlines(
++                replacement_range,
++                text,
++                selected_range,
++                &underlines,
++            )
+         });
+     }
+ }

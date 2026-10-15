@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 21:02:09 -0700
+Subject: [PATCH] gpui: Rasterize glyphs with one font instance per size on
+ macOS
+
+MacTextSystem copied the font at the glyph's size (CTFontCreateCopyWithAttributes)
+for every glyph it rasterized. Each copy is a new Core Text instance, and the
+first glyph drawn with an instance asks for the font's properties
+(CTFontDrawGlyphs -> TBaseFont::SupportsConnectedLanguage ->
+XTCopyPropertiesForFont). For a font registered from a file, which is how a
+variable font's named instances are made available (Inter's weights), that is
+a font registry query of about 3 ms: every glyph rasterized in a new size cost
+3 ms, so a zoom over text in such a font (a canvas's frame headings) hitched
+for 25-117 ms whenever it reached a new size.
+
+The sized fonts glyphs are drawn with are kept per font and size (up to 512,
+then the cache starts over), so a new size costs one query, and the pixels are
+the same (the same font at the same size).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui_macos/src/text_system.rs | 39 +++++++++++++++++++++++++---
+ 1 file changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/crates/gpui_macos/src/text_system.rs b/crates/gpui_macos/src/text_system.rs
+index adb8d60..d594659 100644
+--- a/crates/gpui_macos/src/text_system.rs
++++ b/crates/gpui_macos/src/text_system.rs
+@@ -39,7 +39,7 @@ use gpui::{
+     RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
+     Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
+ };
+-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
++use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
+ use pathfinder_geometry::{
+     rect::{RectF, RectI},
+     transform2d::Transform2F,
+@@ -71,8 +71,16 @@ struct MacTextSystemState {
+     font_ids_by_postscript_name: HashMap<String, FontId>,
+     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
+     postscript_names_by_font_id: HashMap<FontId, String>,
++    /// The fonts glyphs are rasterized with, by font and size (see
++    /// [`MacTextSystemState::sized_font`]).
++    sized_fonts: Mutex<HashMap<(FontId, u32), CTFont>>,
+ }
+ 
++/// Sized fonts kept for rasterizing glyphs at most; beyond it the cache
++/// starts over (glyph sizes are few: a UI's type scale, a canvas's quantized
++/// sizes).
++const MAX_SIZED_FONTS: usize = 512;
++
+ impl MacTextSystem {
+     /// Create a new MacTextSystem.
+     pub fn new() -> Self {
+@@ -84,6 +92,7 @@ impl MacTextSystem {
+             font_ids_by_postscript_name: HashMap::default(),
+             font_ids_by_font_key: HashMap::default(),
+             postscript_names_by_font_id: HashMap::default(),
++            sized_fonts: Mutex::new(HashMap::default()),
+         }))
+     }
+ }
+@@ -418,6 +427,30 @@ impl MacTextSystemState {
+             })
+     }
+ 
++    /// The font at `font_size`, to draw glyphs with: made once per font and
++    /// size, not once per glyph. Each copy of a font is its own Core Text
++    /// instance, and the first glyph drawn with an instance asks for the
++    /// font's properties (`CTFontDrawGlyphs` -> `TBaseFont::
++    /// SupportsConnectedLanguage`); for a font registered from a file (a
++    /// variable font's named instances, which Core Text only exposes that
++    /// way) that is a font registry query of about 3 ms, so every glyph
++    /// rasterized in a new size cost that before.
++    fn sized_font(&self, font_id: FontId, font_size: f32) -> CTFont {
++        let key = (font_id, font_size.to_bits());
++        if let Some(font) = self.sized_fonts.lock().get(&key) {
++            return font.clone();
++        }
++        let font = self.fonts[font_id.0]
++            .native_font()
++            .clone_with_font_size(font_size as CGFloat);
++        let mut sized = self.sized_fonts.lock();
++        if sized.len() >= MAX_SIZED_FONTS {
++            sized.clear();
++        }
++        sized.insert(key, font.clone());
++        font
++    }
++
+     fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+         let font = &self.fonts[params.font_id.0];
+         let scale = Transform2F::from_scale(params.scale_factor);
+@@ -510,9 +543,7 @@ impl MacTextSystemState {
+             } else {
+                 cx.set_gray_fill_color(0.0, 1.0);
+             }
+-            self.fonts[params.font_id.0]
+-                .native_font()
+-                .clone_with_font_size(f32::from(params.font_size) as CGFloat)
++            self.sized_font(params.font_id, f32::from(params.font_size))
+                 .draw_glyphs(
+                     &[params.glyph_id.0 as CGGlyph],
+                     &[CGPoint::new(

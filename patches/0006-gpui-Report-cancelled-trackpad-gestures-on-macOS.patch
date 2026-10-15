@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 00:50:58 -0700
+Subject: [PATCH] gpui: Report cancelled trackpad gestures on macOS
+
+NSEventPhaseCancelled fell through to TouchPhase::Moved for magnify and
+scroll-wheel events, so a gesture the system takes over (Mission Control,
+an app switch, a conflicting gesture) never ended for the app: a pinch
+handler waiting for Ended stayed mid-pinch. Both now report
+TouchPhase::Cancelled, which GPUI already defines and its scroll gesture
+filter already handles.
+---
+ crates/gpui_macos/src/events.rs | 46 +++++++++++++++++++++++----------
+ 1 file changed, 32 insertions(+), 14 deletions(-)
+
+diff --git a/crates/gpui_macos/src/events.rs b/crates/gpui_macos/src/events.rs
+index 71bcb10..37857fe 100644
+--- a/crates/gpui_macos/src/events.rs
++++ b/crates/gpui_macos/src/events.rs
+@@ -101,6 +101,21 @@ unsafe fn read_modifiers(native_event: id) -> Modifiers {
+     }
+ }
+ 
++/// The phase of a trackpad gesture (magnify, scroll). A cancelled gesture
++/// (the system took it over: Mission Control, an app switch, a conflicting
++/// gesture) reports `Cancelled` and never an end, so consumers must see it
++/// to unwind whatever the gesture started.
++fn touch_phase(phase: NSEventPhase) -> TouchPhase {
++    match phase {
++        NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
++            TouchPhase::Started
++        }
++        NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
++        NSEventPhase::NSEventPhaseCancelled => TouchPhase::Cancelled,
++        _ => TouchPhase::Moved,
++    }
++}
++
+ pub(crate) unsafe fn platform_input_from_native(
+     native_event: id,
+     window_height: Option<Pixels>,
+@@ -235,13 +250,7 @@ pub(crate) unsafe fn platform_input_from_native(
+                 }
+             }
+             NSEventType::NSEventTypeMagnify => window_height.map(|window_height| {
+-                let phase = match native_event.phase() {
+-                    NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
+-                        TouchPhase::Started
+-                    }
+-                    NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
+-                    _ => TouchPhase::Moved,
+-                };
++                let phase = touch_phase(native_event.phase());
+ 
+                 let magnification = native_event.magnification() as f32;
+ 
+@@ -256,13 +265,7 @@ pub(crate) unsafe fn platform_input_from_native(
+                 })
+             }),
+             NSEventType::NSScrollWheel => window_height.map(|window_height| {
+-                let phase = match native_event.phase() {
+-                    NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
+-                        TouchPhase::Started
+-                    }
+-                    NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
+-                    _ => TouchPhase::Moved,
+-                };
++                let phase = touch_phase(native_event.phase());
+ 
+                 let raw_data = point(
+                     native_event.scrollingDeltaX() as f32,
+@@ -572,3 +575,18 @@ fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
+     }
+     String::from_utf16(&buffer[..buffer_size]).unwrap_or_default()
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn gesture_phases() {
++        assert_eq!(touch_phase(NSEventPhase::NSEventPhaseMayBegin), TouchPhase::Started);
++        assert_eq!(touch_phase(NSEventPhase::NSEventPhaseBegan), TouchPhase::Started);
++        assert_eq!(touch_phase(NSEventPhase::NSEventPhaseChanged), TouchPhase::Moved);
++        assert_eq!(touch_phase(NSEventPhase::NSEventPhaseStationary), TouchPhase::Moved);
++        assert_eq!(touch_phase(NSEventPhase::NSEventPhaseEnded), TouchPhase::Ended);
++        assert_eq!(touch_phase(NSEventPhase::NSEventPhaseCancelled), TouchPhase::Cancelled);
++    }
++}

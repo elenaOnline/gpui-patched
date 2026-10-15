@@ -1,0 +1,534 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 06:46:20 -0700
+Subject: [PATCH] gpui: Add evictable glyphs to the sprite atlas
+
+The sprite atlas keeps every glyph it ever rasterized, keyed by font, size
+and subpixel variant. That suits a UI with a handful of text sizes, but text
+on a zoomable canvas is drawn at continuously changing sizes, so every zoom
+adds glyph rasters and the atlas grows without bound over a session.
+
+Window::with_evictable_glyphs(f) makes the glyphs and emoji painted inside f
+evictable: the atlas (AtlasState, so every backend's) records the frame they
+were last asked for, and PlatformAtlas::end_frame, which Window::draw calls
+once a frame, drops those not used in the last 120 frames once evictable
+tiles take more than 16 M texels, least recently used first, down to three
+quarters of that. A dropped glyph is rasterized again if it is painted
+again. Tiles also asked for outside such a scope are never dropped, and the
+text system forgets the raster bounds of dropped glyphs so that cache stays
+bounded too. Only tiles unused for 120 frames go, so frames still on the
+GPU never read a reused tile.
+
+PlatformAtlas gains get_or_insert_evictable_with and end_frame with default
+implementations (atlases that never drop tiles), implemented for the Metal,
+wgpu, DirectX (not compiled here) and headless atlases.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/platform.rs              | 210 ++++++++++++++++++++++-
+ crates/gpui/src/text_system.rs           |   9 +
+ crates/gpui/src/window.rs                |  69 ++++++--
+ crates/gpui_apple/src/metal_atlas.rs     |  12 ++
+ crates/gpui_wgpu/src/wgpu_atlas.rs       |  12 ++
+ crates/gpui_windows/src/directx_atlas.rs |  14 ++
+ 6 files changed, 305 insertions(+), 21 deletions(-)
+
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 98bf0a7..1bd36f9 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1439,12 +1439,36 @@ pub trait PlatformAtlas {
+     ) -> Result<Option<AtlasTile>>;
+     fn remove(&self, key: &AtlasKey);
+ 
++    /// Like [`Self::get_or_insert_with`], for a tile the atlas may drop once it has not been
++    /// asked for in a while (see [`AtlasState::end_frame`]); a tile also asked for without this
++    /// is kept. Atlases that never drop tiles insert it like any other.
++    fn get_or_insert_evictable_with<'a>(
++        &self,
++        key: AtlasKey,
++        build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
++    ) -> Result<Option<AtlasTile>> {
++        self.get_or_insert_with(key, build)
++    }
++
++    /// Ends a frame: drops evictable tiles unused for a while if they take more room than the
++    /// atlas allows them, least recently used first, and returns their keys.
++    fn end_frame(&self) -> Vec<AtlasKey> {
++        Vec::new()
++    }
++
+     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+     fn contains(&self, _key: &AtlasKey) -> bool {
+         false
+     }
+ }
+ 
++/// Evictable tiles (see [`PlatformAtlas::get_or_insert_evictable_with`]) may take this many
++/// texels (16 MB of monochrome glyphs) before the least recently used are dropped.
++pub const EVICTABLE_ATLAS_TEXELS: u64 = 16 << 20;
++/// Evictable tiles used in the last this many frames are never dropped (frames still on the
++/// GPU and replayed views may use them).
++pub const EVICTABLE_KEEP_FRAMES: u64 = 120;
++
+ #[doc(hidden)]
+ pub trait AtlasBackend {
+     fn insert(
+@@ -1459,14 +1483,35 @@ pub trait AtlasBackend {
+ 
+ #[doc(hidden)]
+ pub struct AtlasState<Backend> {
+-    tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
++    tiles_by_key: FxHashMap<AtlasKey, AtlasEntry>,
++    /// Frames ended so far (see `end_frame`).
++    frame: u64,
++    /// Texels of the evictable tiles.
++    evictable_texels: u64,
++    /// The frame whose end last looked for tiles to drop.
++    last_eviction: u64,
+     pub backend: Backend,
+ }
+ 
++#[derive(Clone, Copy)]
++struct AtlasEntry {
++    tile: AtlasTile,
++    /// For an evictable tile, the last frame it was asked for.
++    last_used: Option<u64>,
++}
++
++fn tile_texels(tile: &AtlasTile) -> u64 {
++    let size = tile.bounds.size;
++    size.width.0.max(0) as u64 * size.height.0.max(0) as u64
++}
++
+ impl<Backend> AtlasState<Backend> {
+     pub fn new(backend: Backend) -> Self {
+         Self {
+             tiles_by_key: FxHashMap::default(),
++            frame: 0,
++            evictable_texels: 0,
++            last_eviction: 0,
+             backend,
+         }
+     }
+@@ -1475,8 +1520,14 @@ impl<Backend> AtlasState<Backend> {
+         self.tiles_by_key.contains_key(key)
+     }
+ 
++    /// Texels of the evictable tiles.
++    pub fn evictable_texels(&self) -> u64 {
++        self.evictable_texels
++    }
++
+     pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
+         self.tiles_by_key.clear();
++        self.evictable_texels = 0;
+         reset_backend(&mut self.backend);
+     }
+ }
+@@ -1492,9 +1543,39 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
+         &mut self,
+         key: AtlasKey,
+         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
++    ) -> Result<Option<AtlasTile>> {
++        self.get_or_insert(key, false, build)
++    }
++
++    /// See [`PlatformAtlas::get_or_insert_evictable_with`].
++    pub fn get_or_insert_evictable_with<'a>(
++        &mut self,
++        key: AtlasKey,
++        build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
++    ) -> Result<Option<AtlasTile>> {
++        self.get_or_insert(key, true, build)
++    }
++
++    fn get_or_insert<'a>(
++        &mut self,
++        key: AtlasKey,
++        evictable: bool,
++        build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+     ) -> Result<Option<AtlasTile>> {
+         match self.tiles_by_key.entry(key) {
+-            Entry::Occupied(entry) => Ok(Some(*entry.get())),
++            Entry::Occupied(mut entry) => {
++                let entry = entry.get_mut();
++                if let Some(last_used) = &mut entry.last_used {
++                    if evictable {
++                        *last_used = self.frame;
++                    } else {
++                        // asked for as a tile to keep
++                        entry.last_used = None;
++                        self.evictable_texels -= tile_texels(&entry.tile);
++                    }
++                }
++                Ok(Some(entry.tile))
++            }
+             Entry::Vacant(entry) => {
+                 profiling::scope!("new tile");
+                 let Some((size, bytes)) = build()? else {
+@@ -1503,15 +1584,61 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
+                 let tile = self
+                     .backend
+                     .insert(entry.key().texture_kind(), size, &bytes)?;
+-                entry.insert(tile);
++                if evictable {
++                    self.evictable_texels += tile_texels(&tile);
++                }
++                entry.insert(AtlasEntry {
++                    tile,
++                    last_used: evictable.then_some(self.frame),
++                });
+                 Ok(Some(tile))
+             }
+         }
+     }
+ 
++    /// See [`PlatformAtlas::end_frame`]: over [`EVICTABLE_ATLAS_TEXELS`], drops evictable
++    /// tiles not used in the last [`EVICTABLE_KEEP_FRAMES`] frames, least recently used first,
++    /// down to three quarters of it (looking at most once a second's worth of frames).
++    pub fn end_frame(&mut self) -> Vec<AtlasKey> {
++        self.frame += 1;
++        if self.evictable_texels <= EVICTABLE_ATLAS_TEXELS
++            || self.frame < self.last_eviction + EVICTABLE_KEEP_FRAMES / 2
++        {
++            return Vec::new();
++        }
++        self.last_eviction = self.frame;
++        let keep_after = self.frame.saturating_sub(EVICTABLE_KEEP_FRAMES);
++        let mut unused: Vec<(u64, AtlasKey)> = self
++            .tiles_by_key
++            .iter()
++            .filter_map(|(key, entry)| {
++                entry
++                    .last_used
++                    .filter(|last_used| *last_used < keep_after)
++                    .map(|last_used| (last_used, key.clone()))
++            })
++            .collect();
++        unused.sort_by_key(|(last_used, _)| *last_used);
++        let mut evicted = Vec::new();
++        for (_, key) in unused {
++            if self.evictable_texels <= EVICTABLE_ATLAS_TEXELS / 4 * 3 {
++                break;
++            }
++            if let Some(entry) = self.tiles_by_key.remove(&key) {
++                self.evictable_texels -= tile_texels(&entry.tile);
++                self.backend.remove(entry.tile);
++                evicted.push(key);
++            }
++        }
++        evicted
++    }
++
+     pub fn remove(&mut self, key: &AtlasKey) {
+-        if let Some(tile) = self.tiles_by_key.remove(key) {
+-            self.backend.remove(tile);
++        if let Some(entry) = self.tiles_by_key.remove(key) {
++            if entry.last_used.is_some() {
++                self.evictable_texels -= tile_texels(&entry.tile);
++            }
++            self.backend.remove(entry.tile);
+         }
+     }
+ }
+@@ -1565,6 +1692,18 @@ impl PlatformAtlas for HeadlessAtlas {
+         self.0.lock().get_or_insert_with(key, build)
+     }
+ 
++    fn get_or_insert_evictable_with<'a>(
++        &self,
++        key: AtlasKey,
++        build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
++    ) -> Result<Option<AtlasTile>> {
++        self.0.lock().get_or_insert_evictable_with(key, build)
++    }
++
++    fn end_frame(&self) -> Vec<AtlasKey> {
++        self.0.lock().end_frame()
++    }
++
+     fn remove(&self, key: &AtlasKey) {
+         self.0.lock().remove(key);
+     }
+@@ -3327,6 +3466,67 @@ mod atlas_tests {
+         assert_eq!(state.backend.removed_tiles, vec![tile]);
+         Ok(())
+     }
++
++    /// A tile of `EVICTABLE_ATLAS_TEXELS / 8` texels.
++    fn build_big_tile() -> Result<Option<(Size<DevicePixels>, Cow<'static, [u8]>)>> {
++        let side = ((EVICTABLE_ATLAS_TEXELS / 8) as f64).sqrt() as i32;
++        Ok(Some((
++            Size {
++                width: DevicePixels(side),
++                height: DevicePixels(side),
++            },
++            Cow::Borrowed(&[]),
++        )))
++    }
++
++    #[test]
++    fn unused_evictable_tiles_are_dropped_beyond_the_budget() -> Result<()> {
++        let mut state = AtlasState::new(RecordingAtlasBackend::default());
++        // A kept tile, and 12 evictable ones (1.5 budgets), the first four used again later.
++        let kept = image_key(1000);
++        state.get_or_insert_with(kept.clone(), &mut build_big_tile)?;
++        for i in 0..12 {
++            state.get_or_insert_evictable_with(image_key(i), &mut build_big_tile)?;
++            state.end_frame();
++        }
++        assert!(state.evictable_texels() > EVICTABLE_ATLAS_TEXELS);
++        // Nothing is dropped while every tile was used recently.
++        assert!(state.backend.removed_tiles.is_empty());
++        // (tiles unused for a while are looked for every half while)
++        for _ in 0..EVICTABLE_KEEP_FRAMES * 2 {
++            for i in 0..4 {
++                state.get_or_insert_evictable_with(image_key(i), &mut build_big_tile)?;
++            }
++            state.end_frame();
++        }
++        // The least recently used went, down to three quarters of the budget.
++        assert!(state.evictable_texels() <= EVICTABLE_ATLAS_TEXELS / 4 * 3);
++        assert!(
++            !state.contains(&image_key(4)),
++            "the oldest unused tile went"
++        );
++        for i in 0..4 {
++            assert!(state.contains(&image_key(i)), "tile {i} is in use");
++        }
++        assert!(
++            state.contains(&kept),
++            "tiles asked for without eviction stay"
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn a_tile_also_asked_for_as_kept_is_never_evicted() -> Result<()> {
++        let mut state = AtlasState::new(RecordingAtlasBackend::default());
++        state.get_or_insert_evictable_with(image_key(1), &mut build_big_tile)?;
++        let texels = state.evictable_texels();
++        assert!(texels > 0);
++        state.get_or_insert_with(image_key(1), &mut build_big_tile)?;
++        assert_eq!(state.evictable_texels(), 0);
++        state.remove(&image_key(1));
++        assert_eq!(state.evictable_texels(), 0);
++        Ok(())
++    }
+ }
+ 
+ #[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+diff --git a/crates/gpui/src/text_system.rs b/crates/gpui/src/text_system.rs
+index 0f02603..b9f3ae5 100644
+--- a/crates/gpui/src/text_system.rs
++++ b/crates/gpui/src/text_system.rs
+@@ -559,6 +559,15 @@ impl TextSystem {
+     }
+ 
+     /// Get the rasterized size and location of a specific, rendered glyph.
++    /// Forgets the raster bounds of glyphs the atlas dropped (evictable glyphs, see
++    /// `Window::with_evictable_glyphs`), so the cache does not grow with them.
++    pub(crate) fn forget_raster_bounds(&self, glyphs: impl IntoIterator<Item = RenderGlyphParams>) {
++        let mut raster_bounds = self.raster_bounds.write();
++        for params in glyphs {
++            raster_bounds.remove(&params);
++        }
++    }
++
+     pub(crate) fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+         let raster_bounds = self.raster_bounds.upgradable_read();
+         if let Some(bounds) = raster_bounds.get(params) {
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 0c663c4..32cf29d 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -6,8 +6,8 @@ use crate::Inspector;
+ use crate::profiler;
+ use crate::{
+     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
+-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
++    AsyncWindowContext, AtlasKey, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds,
++    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+     EntityId, EventEmitter, FileDropEvent, FontId, FontSmoothing, Global, GlobalElementId, GlyphId,
+     GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+@@ -1182,6 +1182,9 @@ pub struct Window {
+     pub(crate) element_opacity: f32,
+     shadow_clip: Option<ShadowClip>,
+     font_smoothing: FontSmoothing,
++    /// Glyphs painted now may be dropped from the atlas when unused (see
++    /// `Window::with_evictable_glyphs`).
++    evictable_glyphs: bool,
+     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
+     /// The [`TextInputConfiguration`] most recently forwarded to the platform
+@@ -2045,6 +2048,7 @@ impl Window {
+             element_opacity: 1.0,
+             shadow_clip: None,
+             font_smoothing: FontSmoothing::default(),
++            evictable_glyphs: false,
+             requested_autoscroll: None,
+             last_text_input_configuration: None,
+             focused_text_input_active: false,
+@@ -3320,6 +3324,14 @@ impl Window {
+         }
+         self.dirty_views.clear();
+         self.next_frame.window_active = self.active.get();
++        let evicted = self.sprite_atlas.end_frame();
++        if !evicted.is_empty() {
++            self.text_system()
++                .forget_raster_bounds(evicted.into_iter().filter_map(|key| match key {
++                    AtlasKey::Glyph(params) => Some(params),
++                    _ => None,
++                }));
++        }
+ 
+         // Register requested input handler with the platform window.
+         // Use .take() instead of .pop() to preserve Vec length, so that cached
+@@ -4079,6 +4091,21 @@ impl Window {
+         result
+     }
+ 
++    /// Invoke the given function with glyphs painted inside it rasterized into the sprite atlas
++    /// as tiles it may drop again: once such tiles take more than
++    /// [`crate::EVICTABLE_ATLAS_TEXELS`], those not painted for a while are dropped, least
++    /// recently painted first (and rasterized again if painted again). For text drawn at
++    /// continuously changing sizes, such as on a zoomable canvas, which would otherwise grow
++    /// the atlas without bound. Glyphs also painted outside such a scope are kept. This method
++    /// should only be called during the paint phase of element drawing.
++    pub fn with_evictable_glyphs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
++        self.invalidator.debug_assert_paint();
++        let previous = std::mem::replace(&mut self.evictable_glyphs, true);
++        let result = f(self);
++        self.evictable_glyphs = previous;
++        result
++    }
++
+     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
+     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
+     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
+@@ -4922,13 +4949,18 @@ impl Window {
+ 
+         let raster_bounds = self.text_system().raster_bounds(&params)?;
+         if !raster_bounds.is_zero() {
+-            let tile = self
+-                .sprite_atlas
+-                .get_or_insert_with(params.clone().into(), &mut || {
+-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+-                    Ok(Some((size, Cow::Owned(bytes))))
+-                })?
+-                .expect("Callback above only errors or returns Some");
++            let mut rasterize = || {
++                let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
++                Ok(Some((size, Cow::Owned(bytes))))
++            };
++            let tile = if self.evictable_glyphs {
++                self.sprite_atlas
++                    .get_or_insert_evictable_with(params.clone().into(), &mut rasterize)?
++            } else {
++                self.sprite_atlas
++                    .get_or_insert_with(params.clone().into(), &mut rasterize)?
++            }
++            .expect("Callback above only errors or returns Some");
+             let bounds = Bounds {
+                 origin: integer_origin + raster_bounds.origin.map(Into::into),
+                 size: tile.bounds.size.map(Into::into),
+@@ -5034,13 +5066,18 @@ impl Window {
+ 
+         let raster_bounds = self.text_system().raster_bounds(&params)?;
+         if !raster_bounds.is_zero() {
+-            let tile = self
+-                .sprite_atlas
+-                .get_or_insert_with(params.clone().into(), &mut || {
+-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+-                    Ok(Some((size, Cow::Owned(bytes))))
+-                })?
+-                .expect("Callback above only errors or returns Some");
++            let mut rasterize = || {
++                let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
++                Ok(Some((size, Cow::Owned(bytes))))
++            };
++            let tile = if self.evictable_glyphs {
++                self.sprite_atlas
++                    .get_or_insert_evictable_with(params.clone().into(), &mut rasterize)?
++            } else {
++                self.sprite_atlas
++                    .get_or_insert_with(params.clone().into(), &mut rasterize)?
++            }
++            .expect("Callback above only errors or returns Some");
+ 
+             let bounds = Bounds {
+                 origin: integer_origin + raster_bounds.origin.map(Into::into),
+diff --git a/crates/gpui_apple/src/metal_atlas.rs b/crates/gpui_apple/src/metal_atlas.rs
+index 0e8b800..f4514a4 100644
+--- a/crates/gpui_apple/src/metal_atlas.rs
++++ b/crates/gpui_apple/src/metal_atlas.rs
+@@ -46,6 +46,18 @@ impl PlatformAtlas for MetalAtlas {
+         self.0.lock().get_or_insert_with(key, build)
+     }
+ 
++    fn get_or_insert_evictable_with<'a>(
++        &self,
++        key: AtlasKey,
++        build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
++    ) -> Result<Option<AtlasTile>> {
++        self.0.lock().get_or_insert_evictable_with(key, build)
++    }
++
++    fn end_frame(&self) -> Vec<AtlasKey> {
++        self.0.lock().end_frame()
++    }
++
+     fn remove(&self, key: &AtlasKey) {
+         self.0.lock().remove(key);
+     }
+diff --git a/crates/gpui_wgpu/src/wgpu_atlas.rs b/crates/gpui_wgpu/src/wgpu_atlas.rs
+index b541607..19e7cab 100644
+--- a/crates/gpui_wgpu/src/wgpu_atlas.rs
++++ b/crates/gpui_wgpu/src/wgpu_atlas.rs
+@@ -119,6 +119,18 @@ impl PlatformAtlas for WgpuAtlas {
+         self.0.lock().get_or_insert_with(key, build)
+     }
+ 
++    fn get_or_insert_evictable_with<'a>(
++        &self,
++        key: AtlasKey,
++        build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
++    ) -> Result<Option<AtlasTile>> {
++        self.0.lock().get_or_insert_evictable_with(key, build)
++    }
++
++    fn end_frame(&self) -> Vec<AtlasKey> {
++        self.0.lock().end_frame()
++    }
++
+     fn remove(&self, key: &AtlasKey) {
+         self.0.lock().remove(key);
+     }
+diff --git a/crates/gpui_windows/src/directx_atlas.rs b/crates/gpui_windows/src/directx_atlas.rs
+index 622c1cb..cab61e4 100644
+--- a/crates/gpui_windows/src/directx_atlas.rs
++++ b/crates/gpui_windows/src/directx_atlas.rs
+@@ -83,6 +83,20 @@ impl PlatformAtlas for DirectXAtlas {
+         self.0.lock().get_or_insert_with(key, build)
+     }
+ 
++    fn get_or_insert_evictable_with<'a>(
++        &self,
++        key: AtlasKey,
++        build: &mut dyn FnMut() -> anyhow::Result<
++            Option<(Size<DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
++        >,
++    ) -> anyhow::Result<Option<AtlasTile>> {
++        self.0.lock().get_or_insert_evictable_with(key, build)
++    }
++
++    fn end_frame(&self) -> Vec<AtlasKey> {
++        self.0.lock().end_frame()
++    }
++
+     fn remove(&self, key: &AtlasKey) {
+         self.0.lock().remove(key);
+     }

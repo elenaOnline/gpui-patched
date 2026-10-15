@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 06:10:09 -0700
+Subject: [PATCH] gpui: Offer the input handler's text to macOS Services
+
+A GPUI view never answered `validRequestorForSendType:returnType:`, so the
+system's Services (the application menu's, and the ones AppKit adds to a
+context menu shown with `popUpContextMenu:withEvent:forView:`) were never
+available for text being edited in GPUI, as they are in every AppKit text
+view and in browsers.
+
+The view is now a services requestor for plain text: it sends the input
+handler's selected text when some is selected, receives text when the
+handler accepts text input (replacing the selection, as typed text does),
+and otherwise defers to the next responder as NSView does. Only plain text
+is exchanged (the current UTI and the legacy NSStringPboardType).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui_macos/src/window.rs | 109 ++++++++++++++++++++++++++++++++
+ 1 file changed, 109 insertions(+)
+
+diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+index 6864e4a..829cc4f 100644
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -299,6 +299,21 @@ unsafe fn build_classes() {
+                 sel!(characterIndexForPoint:),
+                 character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
+             );
++
++            // macOS Services (and the Services a context menu shows) for the
++            // input handler's text.
++            decl.add_method(
++                sel!(validRequestorForSendType:returnType:),
++                valid_requestor_for_send_type as extern "C" fn(&Object, Sel, id, id) -> id,
++            );
++            decl.add_method(
++                sel!(writeSelectionToPasteboard:types:),
++                write_selection_to_pasteboard as extern "C" fn(&Object, Sel, id, id) -> BOOL,
++            );
++            decl.add_method(
++                sel!(readSelectionFromPasteboard:),
++                read_selection_from_pasteboard as extern "C" fn(&Object, Sel, id) -> BOOL,
++            );
+             decl.register()
+         };
+         BLURRED_VIEW_CLASS = {
+@@ -3648,6 +3663,100 @@ extern "C" fn character_index_for_point(this: &Object, _: Sel, position: NSPoint
+     .unwrap_or(NSNotFound as u64)
+ }
+ 
++/// Whether a Services pasteboard type is plain text (the current UTI or the
++/// legacy `NSStringPboardType`).
++fn is_plain_text_type(pasteboard_type: id) -> bool {
++    if pasteboard_type == nil {
++        return false;
++    }
++    unsafe {
++        let is = |name: &str| -> bool {
++            let equal: BOOL = msg_send![pasteboard_type, isEqualToString: ns_string(name)];
++            equal == YES
++        };
++        is("public.utf8-plain-text") || is("NSStringPboardType")
++    }
++}
++
++/// The input handler's selected text, if any is selected.
++fn selected_text(this: &Object) -> Option<String> {
++    with_input_handler(this, |input_handler| {
++        let selection = input_handler.selected_text_range(false)?;
++        if selection.range.is_empty() {
++            return None;
++        }
++        input_handler.text_for_range(selection.range, &mut None)
++    })
++    .flatten()
++    .filter(|text| !text.is_empty())
++}
++
++/// `NSServicesMenuRequestor`: the view takes part in a service that sends
++/// plain text when its input handler has text selected, and in one that
++/// returns plain text when it accepts text input; otherwise the next
++/// responder is asked (`NSView`'s implementation).
++extern "C" fn valid_requestor_for_send_type(
++    this: &Object,
++    _: Sel,
++    send_type: id,
++    return_type: id,
++) -> id {
++    let sends = send_type == nil || (is_plain_text_type(send_type) && selected_text(this).is_some());
++    let returns = return_type == nil
++        || (is_plain_text_type(return_type)
++            && with_input_handler(this, |input_handler| input_handler.query_accepts_text_input())
++                .unwrap_or(false));
++    if (send_type != nil || return_type != nil) && sends && returns {
++        return this as *const Object as id;
++    }
++    unsafe {
++        msg_send![super(this, class!(NSView)), validRequestorForSendType: send_type returnType: return_type]
++    }
++}
++
++/// Gives a service the selected text, as plain text.
++extern "C" fn write_selection_to_pasteboard(
++    this: &Object,
++    _: Sel,
++    pasteboard: id,
++    types: id,
++) -> BOOL {
++    let Some(text) = selected_text(this) else {
++        return NO;
++    };
++    unsafe {
++        let count: NSUInteger = msg_send![types, count];
++        let plain_text = (0..count).any(|i| {
++            let pasteboard_type: id = msg_send![types, objectAtIndex: i];
++            is_plain_text_type(pasteboard_type)
++        });
++        if !plain_text {
++            return NO;
++        }
++        let string_type = ns_string("public.utf8-plain-text");
++        let _: NSInteger = msg_send![pasteboard, clearContents];
++        let written: BOOL =
++            msg_send![pasteboard, setString: ns_string(&text) forType: string_type];
++        written
++    }
++}
++
++/// Replaces the selection with the text a service returned.
++extern "C" fn read_selection_from_pasteboard(this: &Object, _: Sel, pasteboard: id) -> BOOL {
++    let text: id = unsafe {
++        msg_send![pasteboard, stringForType: ns_string("public.utf8-plain-text")]
++    };
++    if text == nil {
++        return NO;
++    }
++    let text = unsafe { text.to_str() }.to_owned();
++    with_input_handler(this, |input_handler| {
++        input_handler.replace_text_in_range(None, &text)
++    })
++    .is_some()
++    .to_objc()
++}
++
+ fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels> {
+     let frame = get_frame(this);
+     let window_x = position.x - frame.origin.x;

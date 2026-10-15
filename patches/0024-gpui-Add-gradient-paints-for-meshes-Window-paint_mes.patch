@@ -1,0 +1,1058 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 06:41:16 -0700
+Subject: [PATCH] gpui: Add gradient paints for meshes
+ (Window::paint_mesh_gradient)
+
+A mesh could be painted with any Background, whose gradient has two stops,
+an angle and spans the draw's bounds on screen. A canvas filling shapes
+with SVG gradients (any number of stops, a line or a focal point and a
+circle placed in the shape's own space, padded, reflected or repeated) had
+no way to draw them: the stops, the geometry and the space they live in
+move, turn and scale with the shape.
+
+MeshGradient describes one: its stops (straight colours, interpolated
+straight, as SVG and the HTML canvas interpolate them), a line
+(MeshGradientShape::Linear) or two circles (Radial: the two-point conical
+gradient of canvas createRadialGradient and SVG 2), a spread (pad, reflect,
+repeat) and the map from mesh space to the gradient's space.
+Window::paint_mesh_gradient(mesh, transformation, gradient, paint) paints a
+mesh with it: each fragment's colour is the vertex colour times the paint
+times the gradient's colour there. MeshGradient::color_at is the
+evaluation on the CPU, which the shaders follow: a degenerate gradient (a
+line of no length, two equal circles) or one stop paints the last stop's
+colour, and outside a cone between two circles nothing is painted.
+
+The Metal renderer writes a batch's gradients and their stops to the
+instance buffer (MeshGradientInstance, MeshGradientStopInstance) and a
+draw refers to its gradient by index, so a batch with gradients stays one
+instanced draw call. The vertex shader maps each vertex into its
+gradient's space (a gradient is affine in mesh space, so the
+interpolated position is exact) and the fragment shader finds the offset
+there, spreads it and interpolates between the stops around it. Draws
+without a gradient read nothing more.
+
+wgpu and DirectX rasterize meshes through their path pipelines, where a
+gradient mesh is drawn in the gradient's average colour
+(MeshDraw::path_vertices, MeshGradient::average_color) until their
+retained mesh pipelines are wired.
+
+Tests (gpui_apple): the GPU agrees with color_at pixel for pixel on
+linear and radial gradients (reflected, repeated, padded, a focal point
+outside its circle, a skewed gradient space, a turned mesh, a faded
+paint); color_at's interpolation, spreads, hard edges and degenerate
+cases.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/mesh.rs                 | 220 +++++++++++++-
+ crates/gpui/src/scene.rs                |  28 +-
+ crates/gpui/src/window.rs               |  40 ++-
+ crates/gpui_apple/build.rs              |   2 +
+ crates/gpui_apple/src/metal_renderer.rs | 366 +++++++++++++++++++++++-
+ crates/gpui_apple/src/shaders.metal     |  98 ++++++-
+ 6 files changed, 740 insertions(+), 14 deletions(-)
+
+diff --git a/crates/gpui/src/mesh.rs b/crates/gpui/src/mesh.rs
+index 615f142..355b108 100644
+--- a/crates/gpui/src/mesh.rs
++++ b/crates/gpui/src/mesh.rs
+@@ -15,7 +15,7 @@ use std::sync::{
+     atomic::{AtomicU64, Ordering},
+ };
+ 
+-use crate::{Bounds, Point, Rgba, point, size};
++use crate::{Bounds, Point, Rgba, TransformationMatrix, point, size};
+ 
+ /// Identifies a [`Mesh`]'s geometry, which renderers keep on the GPU while the mesh is in use.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+@@ -181,6 +181,223 @@ impl std::fmt::Debug for MeshData {
+     }
+ }
+ 
++/// A colour of a [`MeshGradient`] at an offset along it.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct MeshGradientStop {
++    /// Where along the gradient, from 0 to 1.
++    pub offset: f32,
++    /// The colour, straight (not premultiplied).
++    pub color: Rgba,
++}
++
++/// What a [`MeshGradient`] paints beyond offsets 0 and 1.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum MeshGradientSpread {
++    /// The end colours continue.
++    #[default]
++    Pad,
++    /// The gradient repeats, mirrored every other time.
++    Reflect,
++    /// The gradient repeats.
++    Repeat,
++}
++
++/// The geometry of a [`MeshGradient`], in the gradient's own space.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum MeshGradientShape {
++    /// Offset 0 at `start`, 1 at `end`, constant across the line between them.
++    Linear {
++        /// Where offset 0 is.
++        start: Point<f32>,
++        /// Where offset 1 is.
++        end: Point<f32>,
++    },
++    /// A two-point conical gradient, as the HTML canvas's `createRadialGradient` and SVG 2's
++    /// `<radialGradient>` (with `fx`, `fy`, `fr`) draw it: offset `t` is on the circle whose
++    /// centre and radius are `t` of the way from the start circle to the end circle (the
++    /// largest `t` whose radius is not negative, where circles overlap). Where no circle
++    /// passes (outside the cone between two circles), nothing is painted.
++    Radial {
++        /// The centre of the circle at offset 0.
++        start: Point<f32>,
++        /// The radius of the circle at offset 0.
++        start_radius: f32,
++        /// The centre of the circle at offset 1.
++        end: Point<f32>,
++        /// The radius of the circle at offset 1.
++        end_radius: f32,
++    },
++}
++
++/// A gradient a mesh can be painted with ([`Window::paint_mesh_gradient`](crate::Window::paint_mesh_gradient)):
++/// colours interpolated between stops (straight, as SVG and the HTML canvas interpolate them)
++/// along a line or between two circles.
++///
++/// A gradient without stops paints nothing; with one stop, or whose geometry is degenerate (a
++/// line of no length, or two equal circles), it paints its last stop's colour.
++#[derive(Clone, Debug, PartialEq)]
++pub struct MeshGradient {
++    /// The line or circles, in the gradient's space.
++    pub shape: MeshGradientShape,
++    /// The colours, in order of offset. Offsets out of order are raised to the offset before
++    /// them (equal offsets make a hard edge, whose later colour starts at its offset).
++    pub stops: Vec<MeshGradientStop>,
++    /// What is painted beyond offsets 0 and 1.
++    pub spread: MeshGradientSpread,
++    /// The mesh's space → the gradient's space.
++    pub to_gradient: TransformationMatrix,
++}
++
++impl MeshGradient {
++    /// The offset along the gradient at `point` (the gradient's space), before spreading, or
++    /// `None` where the gradient paints nothing (outside a conical gradient's cone). A
++    /// degenerate gradient gives 1.
++    pub fn offset_at(&self, point: Point<f32>) -> Option<f32> {
++        match self.shape {
++            MeshGradientShape::Linear { start, end } => {
++                let (dx, dy) = (end.x - start.x, end.y - start.y);
++                let length_squared = dx * dx + dy * dy;
++                if !(length_squared > 0.) {
++                    return Some(1.);
++                }
++                Some(((point.x - start.x) * dx + (point.y - start.y) * dy) / length_squared)
++            }
++            MeshGradientShape::Radial {
++                start,
++                start_radius,
++                end,
++                end_radius,
++            } => {
++                // |p - c(t)| = r(t) for c(t) = c0 + t (c1 - c0), r(t) = r0 + t (r1 - r0):
++                // a t² - 2 b t + c = 0
++                let (cx, cy) = (end.x - start.x, end.y - start.y);
++                let (px, py) = (point.x - start.x, point.y - start.y);
++                let dr = end_radius - start_radius;
++                let a = cx * cx + cy * cy - dr * dr;
++                let b = px * cx + py * cy + start_radius * dr;
++                let c = px * px + py * py - start_radius * start_radius;
++                let radius = |t: f32| start_radius + t * dr;
++                if cx == 0. && cy == 0. && dr == 0. {
++                    return Some(1.);
++                }
++                if a.abs() <= 1e-6 * (cx * cx + cy * cy + dr * dr) {
++                    let t = c / (2. * b);
++                    return (t.is_finite() && radius(t) >= 0.).then_some(t);
++                }
++                let discriminant = b * b - a * c;
++                if discriminant < 0. {
++                    return None;
++                }
++                let root = discriminant.sqrt();
++                let (t0, t1) = ((b - root) / a, (b + root) / a);
++                let (high, low) = (t0.max(t1), t0.min(t1));
++                if radius(high) >= 0. {
++                    Some(high)
++                } else if radius(low) >= 0. {
++                    Some(low)
++                } else {
++                    None
++                }
++            }
++        }
++    }
++
++    /// The straight colour the gradient paints at `point` (the mesh's space), or `None` where
++    /// it paints nothing. Renderers evaluate gradients on the GPU the same way.
++    pub fn color_at(&self, point: Point<f32>) -> Option<Rgba> {
++        let (last, first) = (self.stops.last()?, self.stops.first()?);
++        let m = self.to_gradient;
++        let point = crate::point(
++            m.rotation_scale[0][0] * point.x + m.rotation_scale[0][1] * point.y + m.translation[0],
++            m.rotation_scale[1][0] * point.x + m.rotation_scale[1][1] * point.y + m.translation[1],
++        );
++        if self.stops.len() == 1 || self.is_degenerate() {
++            return Some(last.color);
++        }
++        let t = self.offset_at(point)?;
++        let t = match self.spread {
++            MeshGradientSpread::Pad => t.clamp(0., 1.),
++            MeshGradientSpread::Repeat => t - t.floor(),
++            MeshGradientSpread::Reflect => {
++                let u = t.abs() % 2.;
++                if u > 1. { 2. - u } else { u }
++            }
++        };
++        // (intervals are open at their end: on a hard edge, the later colour)
++        let mut previous = *first;
++        if t < first.offset {
++            return Some(first.color);
++        }
++        for stop in &self.stops[1..] {
++            let offset = stop.offset.max(previous.offset);
++            if t < offset {
++                let k = (t - previous.offset) / (offset - previous.offset);
++                let mix = |a: f32, b: f32| a + (b - a) * k;
++                let (a, b) = (previous.color, stop.color);
++                return Some(Rgba {
++                    r: mix(a.r, b.r),
++                    g: mix(a.g, b.g),
++                    b: mix(a.b, b.b),
++                    a: mix(a.a, b.a),
++                });
++            }
++            previous = MeshGradientStop { offset, ..*stop };
++        }
++        Some(last.color)
++    }
++
++    /// Whether the geometry is degenerate: a line of no length, or two equal circles (the
++    /// gradient paints its last stop's colour).
++    pub fn is_degenerate(&self) -> bool {
++        match self.shape {
++            MeshGradientShape::Linear { start, end } => start == end,
++            MeshGradientShape::Radial {
++                start,
++                start_radius,
++                end,
++                end_radius,
++            } => start == end && start_radius == end_radius,
++        }
++    }
++
++    /// The mean of the stops' colours, weighted by the offsets each covers: what renderers
++    /// that do not evaluate gradients paint instead.
++    pub fn average_color(&self) -> Rgba {
++        let Some(first) = self.stops.first() else {
++            return Rgba::default();
++        };
++        if self.stops.len() == 1 || self.is_degenerate() {
++            return self.stops[self.stops.len() - 1].color;
++        }
++        let mut sum = [0f32; 4];
++        let mut add = |color: Rgba, weight: f32| {
++            sum[0] += color.r * color.a * weight;
++            sum[1] += color.g * color.a * weight;
++            sum[2] += color.b * color.a * weight;
++            sum[3] += color.a * weight;
++        };
++        let mut previous = *first;
++        add(first.color, first.offset.clamp(0., 1.));
++        for stop in &self.stops[1..] {
++            let offset = stop.offset.clamp(previous.offset, 1.);
++            let span = offset - previous.offset;
++            add(previous.color, span / 2.);
++            add(stop.color, span / 2.);
++            previous = MeshGradientStop { offset, ..*stop };
++        }
++        add(previous.color, 1. - previous.offset);
++        if sum[3] <= 0. {
++            return Rgba::default();
++        }
++        Rgba {
++            r: sum[0] / sum[3],
++            g: sum[1] / sum[3],
++            b: sum[2] / sum[3],
++            a: sum[3],
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -280,6 +497,7 @@ mod tests {
+                 b: 1.,
+                 a: 0.5,
+             }),
++            gradient: None,
+             mesh,
+         };
+         let vertices: Vec<_> = draw.path_vertices().collect();
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index fc99645..138457c 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -5,14 +5,15 @@ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::{
+-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Mesh, Pixels,
+-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
++    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Mesh,
++    MeshGradient, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+ };
+ use std::{
+     fmt::Debug,
+     iter::Peekable,
+     ops::{Add, Range, Sub},
+     slice,
++    sync::Arc,
+ };
+ 
+ #[allow(non_camel_case_types, unused)]
+@@ -950,6 +951,9 @@ pub struct MeshDraw {
+     /// What the vertex colours are multiplied by, for scaled pixels (see
+     /// [`crate::Window::paint_mesh`]).
+     pub background: Background,
++    /// A gradient the vertex colours are multiplied by too, in mesh space (see
++    /// [`crate::Window::paint_mesh_gradient`]).
++    pub gradient: Option<Arc<MeshGradient>>,
+     /// The geometry.
+     pub mesh: Mesh,
+ }
+@@ -963,11 +967,25 @@ impl MeshDraw {
+     /// The draw's triangles as path vertices in scaled pixels, each with its paint: for
+     /// renderers that rasterize meshes through their path pipeline instead of keeping them on
+     /// the GPU. A solid paint is multiplied by the vertex colour exactly; a pattern or
+-    /// gradient takes the vertex alpha (meshes painted with one have white vertices).
++    /// gradient takes the vertex alpha (meshes painted with one have white vertices). A mesh
++    /// gradient is drawn in its average colour ([`MeshGradient::average_color`]).
+     pub fn path_vertices(&self) -> impl Iterator<Item = (Point<ScaledPixels>, Background)> + '_ {
+         let m = self.transformation;
+-        let solid = (self.background.tag == crate::BackgroundTag::Solid)
+-            .then(|| crate::Rgba::from(self.background.solid));
++        let solid = (self.background.tag == crate::BackgroundTag::Solid).then(|| {
++            let paint = crate::Rgba::from(self.background.solid);
++            match &self.gradient {
++                Some(gradient) => {
++                    let average = gradient.average_color();
++                    crate::Rgba {
++                        r: paint.r * average.r,
++                        g: paint.g * average.g,
++                        b: paint.b * average.b,
++                        a: paint.a * average.a,
++                    }
++                }
++                None => paint,
++            }
++        });
+         self.mesh.vertices().iter().map(move |vertex| {
+             let [x, y] = vertex.position;
+             let position = point(
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index b06a945..1d9f4ce 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -11,7 +11,7 @@ use crate::{
+     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+     EntityId, EventEmitter, FileDropEvent, FontId, FontSmoothing, Global, GlobalElementId, GlyphId,
+     GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Mesh, MeshDraw, Modifiers,
++    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Mesh, MeshDraw, MeshGradient, Modifiers,
+     ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+     Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+     PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+@@ -4782,6 +4782,42 @@ impl Window {
+         paint: impl Into<Background>,
+     ) {
+         self.invalidator.debug_assert_paint();
++        self.insert_mesh(mesh, transformation, paint.into(), None);
++    }
++
++    /// Paint a [`Mesh`] with a [`MeshGradient`] into the scene for the next frame at the
++    /// current z-index.
++    ///
++    /// As [`Window::paint_mesh`], with each fragment's colour multiplied by the gradient's
++    /// colour there too: `gradient` is in mesh space (its `to_gradient` maps mesh space to the
++    /// gradient's), so it moves, turns and scales with the mesh. White vertices and a white
++    /// `paint` draw the gradient as it is; a translucent white `paint` fades it. Renderers
++    /// evaluate the gradient per pixel (as [`MeshGradient::color_at`] does) on Metal; wgpu and
++    /// DirectX, which rasterize meshes through their path pipelines, draw it in its average
++    /// colour for now.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_mesh_gradient(
++        &mut self,
++        mesh: &Mesh,
++        transformation: TransformationMatrix,
++        gradient: Arc<MeshGradient>,
++        paint: impl Into<Background>,
++    ) {
++        self.invalidator.debug_assert_paint();
++        if gradient.stops.is_empty() {
++            return;
++        }
++        self.insert_mesh(mesh, transformation, paint.into(), Some(gradient));
++    }
++
++    fn insert_mesh(
++        &mut self,
++        mesh: &Mesh,
++        transformation: TransformationMatrix,
++        paint: Background,
++        gradient: Option<Arc<MeshGradient>>,
++    ) {
+         if mesh.is_empty() {
+             return;
+         }
+@@ -4816,7 +4852,6 @@ impl Window {
+                 ScaledPixels(bottom_right.y.0.ceil()),
+             ),
+         );
+-        let paint: Background = paint.into();
+         let opacity = self.element_opacity();
+         let content_mask = self.content_mask().scale(scale_factor);
+         self.next_frame.scene.insert_primitive(MeshDraw {
+@@ -4825,6 +4860,7 @@ impl Window {
+             content_mask,
+             transformation,
+             background: paint.opacity(opacity).scale(scale_factor),
++            gradient,
+             mesh: mesh.clone(),
+         });
+     }
+diff --git a/crates/gpui_apple/build.rs b/crates/gpui_apple/build.rs
+index da59be1..b08f92c 100644
+--- a/crates/gpui_apple/build.rs
++++ b/crates/gpui_apple/build.rs
+@@ -51,6 +51,8 @@ mod macos_build {
+             "MeshInputIndex".into(),
+             "MeshVertex".into(),
+             "MeshDrawInstance".into(),
++            "MeshGradientInstance".into(),
++            "MeshGradientStopInstance".into(),
+             "MeshChunk".into(),
+             "ShadowInputIndex".into(),
+             "Shadow".into(),
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index 20e9504..cfc948a 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -8,8 +8,9 @@ use cocoa::{
+     quartzcore::AutoresizingMask,
+ };
+ use gpui::{
+-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MeshDraw, PaintSurface, Path,
+-    Point, PrimitiveBatch, ScaledPixels, Scene, Shadow, Size, TransformationMatrix, point, size,
++    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MeshDraw, MeshGradient,
++    MeshGradientShape, MeshGradientSpread, PaintSurface, Path, Point, PrimitiveBatch,
++    ScaledPixels, Scene, Shadow, Size, TransformationMatrix, point, size,
+ };
+ #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+ use image::RgbaImage;
+@@ -174,6 +175,36 @@ pub struct MeshDrawInstance {
+     /// The draw's first chunk (its chunks are consecutive).
+     pub first_chunk: u32,
+     pub vertex_count: u32,
++    /// 1 + the index of the draw's gradient in the batch's gradients, or 0 for none.
++    pub gradient: u32,
++}
++
++/// A mesh draw's gradient as the mesh shaders read it.
++#[repr(C)]
++pub struct MeshGradientInstance {
++    /// Mesh space → gradient space.
++    pub to_gradient: TransformationMatrix,
++    /// 0: linear, 1: radial (two-point conical), 2: degenerate (the last stop).
++    pub kind: u32,
++    /// 0: pad, 1: reflect, 2: repeat.
++    pub spread: u32,
++    /// The gradient's first stop in the batch's stops.
++    pub first_stop: u32,
++    pub stop_count: u32,
++    /// Where offset 0 is: a point, or the start circle's centre.
++    pub start: [f32; 2],
++    /// Where offset 1 is: a point, or the end circle's centre.
++    pub end: [f32; 2],
++    /// The circles' radii (radial gradients).
++    pub start_radius: f32,
++    pub end_radius: f32,
++}
++
++/// A gradient stop as the mesh shaders read it: a straight colour and its offset.
++#[repr(C)]
++pub struct MeshGradientStopInstance {
++    pub color: [f32; 4],
++    pub offset: f32,
+ }
+ 
+ /// One instance of a mesh batch's draw call: a block of a draw's mesh.
+@@ -1265,6 +1296,8 @@ impl MetalRenderer {
+     ) -> Result<Option<Bounds<ScaledPixels>>> {
+         let mut draws = Vec::with_capacity(meshes.len());
+         let mut chunks = Vec::new();
++        let mut gradients: Vec<MeshGradientInstance> = Vec::new();
++        let mut stops: Vec<MeshGradientStopInstance> = Vec::new();
+         let mut union: Option<Bounds<ScaledPixels>> = None;
+         for draw in meshes {
+             let clip_bounds = draw.clipped_bounds();
+@@ -1275,6 +1308,13 @@ impl MetalRenderer {
+                 continue;
+             };
+             let index = draws.len() as u32;
++            let gradient = match &draw.gradient {
++                Some(gradient) => {
++                    gradients.push(mesh_gradient_instance(gradient, &mut stops));
++                    gradients.len() as u32
++                }
++                None => 0,
++            };
+             draws.push(MeshDrawInstance {
+                 transformation: draw.transformation,
+                 background: draw.background,
+@@ -1284,6 +1324,7 @@ impl MetalRenderer {
+                 clip_bounds,
+                 first_chunk: chunks.len() as u32,
+                 vertex_count: draw.mesh.len() as u32,
++                gradient,
+             });
+             chunks.extend(blocks.iter().map(|block| MeshChunk {
+                 draw: index,
+@@ -1300,6 +1341,13 @@ impl MetalRenderer {
+         }
+         let draw_bindings = writer.write(&draws)?;
+         let chunk_bindings = writer.write(&chunks)?;
++        // (a batch without gradients binds the draws in their place: the shaders read them
++        // only for draws that have one)
++        let (gradient_bindings, stop_bindings) = if gradients.is_empty() {
++            (None, None)
++        } else {
++            (Some(writer.write(&gradients)?), Some(writer.write(&stops)?))
++        };
+ 
+         command_encoder.set_render_pipeline_state(&self.meshes_rasterization_pipeline_state);
+         // (slots past the last page hold the first: the shader reads only real pages)
+@@ -1343,6 +1391,18 @@ impl MetalRenderer {
+             Some(&draw_bindings.buffer),
+             draw_bindings.offset as u64,
+         );
++        for (index, binding) in [
++            (MeshInputIndex::Gradients as u64, &gradient_bindings),
++            (MeshInputIndex::GradientStops as u64, &stop_bindings),
++        ] {
++            let binding = binding.as_ref().unwrap_or(&draw_bindings);
++            command_encoder.set_vertex_buffer(index, Some(&binding.buffer), binding.offset as u64);
++            command_encoder.set_fragment_buffer(
++                index,
++                Some(&binding.buffer),
++                binding.offset as u64,
++            );
++        }
+         command_encoder.draw_primitives_instanced(
+             metal::MTLPrimitiveType::Triangle,
+             0,
+@@ -2081,6 +2141,70 @@ enum MeshInputIndex {
+     Page5 = 9,
+     Page6 = 10,
+     Page7 = 11,
++    /// The batch's gradients (`MeshGradientInstance`).
++    Gradients = 12,
++    /// The batch's gradient stops (`MeshGradientStopInstance`).
++    GradientStops = 13,
++}
++
++/// A mesh gradient as the mesh shaders read it, its stops appended to `stops`.
++fn mesh_gradient_instance(
++    gradient: &MeshGradient,
++    stops: &mut Vec<MeshGradientStopInstance>,
++) -> MeshGradientInstance {
++    let first_stop = stops.len() as u32;
++    let mut previous = 0f32;
++    for (index, stop) in gradient.stops.iter().enumerate() {
++        // (offsets out of order are raised to the one before)
++        let offset = if index == 0 {
++            stop.offset
++        } else {
++            stop.offset.max(previous)
++        };
++        previous = offset;
++        let c = stop.color;
++        stops.push(MeshGradientStopInstance {
++            color: [c.r, c.g, c.b, c.a],
++            offset,
++        });
++    }
++    let (kind, start, end, start_radius, end_radius) =
++        if gradient.stops.len() == 1 || gradient.is_degenerate() {
++            (2, [0.; 2], [0.; 2], 0., 0.)
++        } else {
++            match gradient.shape {
++                MeshGradientShape::Linear { start, end } => {
++                    (0, [start.x, start.y], [end.x, end.y], 0., 0.)
++                }
++                MeshGradientShape::Radial {
++                    start,
++                    start_radius,
++                    end,
++                    end_radius,
++                } => (
++                    1,
++                    [start.x, start.y],
++                    [end.x, end.y],
++                    start_radius,
++                    end_radius,
++                ),
++            }
++        };
++    MeshGradientInstance {
++        to_gradient: gradient.to_gradient,
++        kind,
++        spread: match gradient.spread {
++            MeshGradientSpread::Pad => 0,
++            MeshGradientSpread::Reflect => 1,
++            MeshGradientSpread::Repeat => 2,
++        },
++        first_stop,
++        stop_count: gradient.stops.len() as u32,
++        start,
++        end,
++        start_radius,
++        end_radius,
++    }
+ }
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -2133,7 +2257,8 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
+ mod mesh_tests {
+     use super::*;
+     use gpui::{
+-        ContentMask, Hsla, Mesh, MeshVertex, Pixels, Rgba, TransformationMatrix, hatch_pattern, px,
++        ContentMask, Hsla, Mesh, MeshGradientStop, MeshVertex, Pixels, Rgba, TransformationMatrix,
++        hatch_pattern, px,
+     };
+ 
+     const SIZE: i32 = 160;
+@@ -2263,6 +2388,7 @@ mod mesh_tests {
+             content_mask: whole_viewport(),
+             transformation: t,
+             background,
++            gradient: None,
+             mesh: mesh.clone(),
+         });
+     }
+@@ -2386,6 +2512,7 @@ mod mesh_tests {
+             },
+             transformation,
+             background: Hsla::white().into(),
++            gradient: None,
+             mesh: mesh.clone(),
+         };
+         let mut scene = Scene::default();
+@@ -2412,4 +2539,237 @@ mod mesh_tests {
+         // (the headless target is opaque black)
+         assert_eq!(pixel(80, 80), [0, 0, 0, 255], "nothing between");
+     }
++
++    /// Gradients evaluated on the GPU agree with `MeshGradient::color_at` pixel for pixel
++    /// (away from the mesh's edges and the gradients' hard edges): linear and radial,
++    /// padded, repeated and reflected, a focal point outside its circle (a cone), through a
++    /// skewed gradient space and a turned mesh, faded by the paint.
++    #[test]
++    fn test_mesh_gradients_match_their_cpu_evaluation() {
++        let Some(mut renderer) = renderer() else {
++            return;
++        };
++        let square = Mesh::new(
++            [
++                point(0., 0.),
++                point(100., 0.),
++                point(100., 100.),
++                point(0., 0.),
++                point(100., 100.),
++                point(0., 100.),
++            ]
++            .map(|p| MeshVertex::new(p, rgba(1., 1., 1., 1.))),
++        );
++        let (sin, cos) = 0.2f32.sin_cos();
++        let t = TransformationMatrix {
++            rotation_scale: [[1.2 * cos, -1.2 * sin], [1.2 * sin, 1.2 * cos]],
++            translation: [30., 8.],
++        };
++        let stop = |offset: f32, color: Rgba| MeshGradientStop { offset, color };
++        let skew = TransformationMatrix {
++            rotation_scale: [[1., 0.3], [0., 1.]],
++            translation: [-5., 3.],
++        };
++        let gradients = [
++            MeshGradient {
++                shape: MeshGradientShape::Linear {
++                    start: point(10., 10.),
++                    end: point(50., 30.),
++                },
++                stops: vec![
++                    stop(0., rgba(1., 0., 0., 1.)),
++                    stop(0.4, rgba(0., 1., 0.5, 0.3)),
++                    stop(1., rgba(0., 0., 1., 1.)),
++                ],
++                spread: MeshGradientSpread::Reflect,
++                to_gradient: skew,
++            },
++            MeshGradient {
++                shape: MeshGradientShape::Radial {
++                    start: point(40., 35.),
++                    start_radius: 0.,
++                    end: point(50., 50.),
++                    end_radius: 30.,
++                },
++                stops: vec![
++                    stop(0.1, rgba(1., 1., 0.8, 1.)),
++                    stop(0.6, rgba(0.9, 0.4, 0.1, 1.)),
++                    stop(1., rgba(0.2, 0.1, 0.3, 0.8)),
++                ],
++                spread: MeshGradientSpread::Repeat,
++                to_gradient: TransformationMatrix::unit(),
++            },
++            MeshGradient {
++                shape: MeshGradientShape::Radial {
++                    start: point(5., 50.),
++                    start_radius: 0.,
++                    end: point(60., 50.),
++                    end_radius: 20.,
++                },
++                stops: vec![
++                    stop(0., rgba(0., 0.5, 1., 1.)),
++                    stop(1., rgba(1., 1., 1., 1.)),
++                ],
++                spread: MeshGradientSpread::Pad,
++                to_gradient: TransformationMatrix::unit(),
++            },
++        ];
++        let det = t.rotation_scale[0][0] * t.rotation_scale[1][1]
++            - t.rotation_scale[0][1] * t.rotation_scale[1][0];
++        for (index, gradient) in gradients.into_iter().enumerate() {
++            let gradient = Arc::new(gradient);
++            let mut scene = Scene::default();
++            let b = square.bounds();
++            scene.insert_primitive(MeshDraw {
++                order: 0,
++                bounds: t
++                    .transform_bounds(Bounds {
++                        origin: b.origin.map(ScaledPixels),
++                        size: b.size.map(ScaledPixels),
++                    })
++                    .dilate(ScaledPixels(1.)),
++                content_mask: whole_viewport(),
++                transformation: t,
++                background: rgba(1., 1., 1., 0.8).into(),
++                gradient: Some(gradient.clone()),
++                mesh: square.clone(),
++            });
++            let image = render(&mut renderer, &mut scene);
++            let (mut compared, mut differing, mut transparent) = (0, 0, 0);
++            for (x, y, pixel) in image.enumerate_pixels() {
++                // the pixel centre in mesh space
++                let (px, py) = (
++                    x as f32 + 0.5 - t.translation[0],
++                    y as f32 + 0.5 - t.translation[1],
++                );
++                let m = t.rotation_scale;
++                let mx = (m[1][1] * px - m[0][1] * py) / det;
++                let my = (-m[1][0] * px + m[0][0] * py) / det;
++                if !(2. ..=98.).contains(&mx) || !(2. ..=98.).contains(&my) {
++                    continue;
++                }
++                let expected = gradient.color_at(point(mx, my)).unwrap_or_default();
++                let a = expected.a * 0.8;
++                let expected = [expected.r * a, expected.g * a, expected.b * a]
++                    .map(|v| (v * 255.).round() as i32);
++                compared += 1;
++                transparent += usize::from(a == 0.);
++                let d = (0..3)
++                    .map(|c| (i32::from(pixel.0[c]) - expected[c]).abs())
++                    .max()
++                    .unwrap_or(0);
++                differing += usize::from(d > 2);
++            }
++            assert!(compared > 10_000, "gradient {index}: {compared} pixels compared");
++            // (a pixel on a hard edge, the reflection's turns or the repeat's seams may
++            // land on either side)
++            assert!(
++                differing * 200 < compared,
++                "gradient {index}: {differing} of {compared} pixels differ by more than 2"
++            );
++            if index == 2 {
++                assert!(
++                    transparent > 1_000,
++                    "outside the cone nothing is painted: {transparent} pixels"
++                );
++            }
++        }
++    }
++
++    /// `MeshGradient::color_at`, the CPU evaluation the shaders follow: straight
++    /// interpolation, spreads, hard edges, degenerate gradients, focal points and cones.
++    #[test]
++    fn test_mesh_gradient_colors() {
++        let red = Rgba {
++            r: 1.,
++            g: 0.,
++            b: 0.,
++            a: 1.,
++        };
++        let clear_blue = Rgba {
++            r: 0.,
++            g: 0.,
++            b: 1.,
++            a: 0.,
++        };
++        let linear = |spread| MeshGradient {
++            shape: MeshGradientShape::Linear {
++                start: point(0., 0.),
++                end: point(10., 0.),
++            },
++            stops: vec![
++                MeshGradientStop {
++                    offset: 0.,
++                    color: red,
++                },
++                MeshGradientStop {
++                    offset: 1.,
++                    color: clear_blue,
++                },
++            ],
++            spread,
++            to_gradient: TransformationMatrix::unit(),
++        };
++        // straight interpolation: halfway is half red, half blue, half transparent
++        let half = linear(MeshGradientSpread::Pad).color_at(point(5., 3.)).unwrap();
++        assert!((half.r - 0.5).abs() < 1e-6 && (half.b - 0.5).abs() < 1e-6);
++        assert!((half.a - 0.5).abs() < 1e-6);
++        let at = |spread, x: f32| linear(spread).color_at(point(x, 0.)).unwrap().r;
++        assert_eq!(at(MeshGradientSpread::Pad, -4.), 1.);
++        assert_eq!(at(MeshGradientSpread::Pad, 14.), 0.);
++        assert!((at(MeshGradientSpread::Repeat, 12.5) - 0.75).abs() < 1e-5);
++        assert!((at(MeshGradientSpread::Reflect, 12.5) - 0.25).abs() < 1e-5);
++        assert!((at(MeshGradientSpread::Reflect, -2.5) - 0.75).abs() < 1e-5);
++
++        // a hard edge where two stops share an offset
++        let mut hard = linear(MeshGradientSpread::Pad);
++        hard.stops.insert(
++            1,
++            MeshGradientStop {
++                offset: 0.5,
++                color: red,
++            },
++        );
++        hard.stops.insert(
++            2,
++            MeshGradientStop {
++                offset: 0.5,
++                color: clear_blue,
++            },
++        );
++        assert_eq!(hard.color_at(point(4.9, 0.)).unwrap().r, 1.);
++        assert_eq!(hard.color_at(point(5.1, 0.)).unwrap().b, 1.);
++        // (on the edge itself, the later colour, as Skia and resvg draw it)
++        assert_eq!(hard.color_at(point(5., 0.)).unwrap().b, 1.);
++
++        // degenerate: the last stop; no stops: nothing
++        let mut flat = linear(MeshGradientSpread::Pad);
++        flat.shape = MeshGradientShape::Linear {
++            start: point(3., 3.),
++            end: point(3., 3.),
++        };
++        assert_eq!(flat.color_at(point(0., 0.)), Some(clear_blue));
++        flat.stops.clear();
++        assert_eq!(flat.color_at(point(0., 0.)), None);
++
++        // radial: offset 0 at the focal point, 1 on the circle; outside a cone, nothing
++        let radial = |focal: Point<f32>| MeshGradient {
++            shape: MeshGradientShape::Radial {
++                start: focal,
++                start_radius: 0.,
++                end: point(0., 0.),
++                end_radius: 10.,
++            },
++            ..linear(MeshGradientSpread::Pad)
++        };
++        let centred = radial(point(0., 0.));
++        assert!((centred.offset_at(point(3., 4.)).unwrap() - 0.5).abs() < 1e-6);
++        let focal = radial(point(5., 0.));
++        assert!(focal.offset_at(point(5., 0.)).unwrap().abs() < 1e-6);
++        assert!((focal.offset_at(point(-10., 0.)).unwrap() - 1.).abs() < 1e-5);
++        assert!((focal.offset_at(point(0., 10.)).unwrap() - 1.).abs() < 1e-5);
++        let outside = radial(point(20., 0.));
++        assert!(outside.offset_at(point(20., 10.)).is_none());
++        assert!(outside.offset_at(point(5., 0.)).is_some());
++    }
+ }
+diff --git a/crates/gpui_apple/src/shaders.metal b/crates/gpui_apple/src/shaders.metal
+index b8945ff..51b6928 100644
+--- a/crates/gpui_apple/src/shaders.metal
++++ b/crates/gpui_apple/src/shaders.metal
+@@ -924,6 +924,8 @@ struct MeshVertexOutput {
+   float4 paint_color0 [[flat]];
+   float4 paint_color1 [[flat]];
+   uint draw_id [[flat]];
++  // The vertex in its draw's gradient space (a gradient is affine in mesh space).
++  float2 gradient_position;
+   float clip_distance [[clip_distance]][4];
+ };
+ 
+@@ -934,8 +936,86 @@ struct MeshFragmentInput {
+   float4 paint_color0 [[flat]];
+   float4 paint_color1 [[flat]];
+   uint draw_id [[flat]];
++  float2 gradient_position;
+ };
+ 
++// The straight colour of a mesh gradient at `p` (its own space), as `MeshGradient::color_at`
++// computes it; transparent where a conical gradient paints nothing.
++float4 mesh_gradient_color(MeshGradientInstance g, device const MeshGradientStopInstance *stops,
++                           float2 p) {
++  device const MeshGradientStopInstance *s = stops + g.first_stop;
++  MeshGradientStopInstance last = s[g.stop_count - 1];
++  float4 last_color = float4(last.color[0], last.color[1], last.color[2], last.color[3]);
++  if (g.kind == 2) {
++    return last_color;
++  }
++  float2 start = float2(g.start[0], g.start[1]);
++  float2 end = float2(g.end[0], g.end[1]);
++  float t;
++  if (g.kind == 0) {
++    float2 d = end - start;
++    t = dot(p - start, d) / dot(d, d);
++  } else {
++    // |p - c(t)| = r(t) for c(t) = c0 + t (c1 - c0), r(t) = r0 + t (r1 - r0):
++    // a t² - 2 b t + c = 0, the largest root whose radius is not negative
++    float2 cd = end - start;
++    float2 pd = p - start;
++    float r0 = g.start_radius;
++    float dr = g.end_radius - r0;
++    float a = dot(cd, cd) - dr * dr;
++    float b = dot(pd, cd) + r0 * dr;
++    float c = dot(pd, pd) - r0 * r0;
++    if (abs(a) <= 1e-6 * (dot(cd, cd) + dr * dr)) {
++      t = c / (2. * b);
++      if (!isfinite(t) || r0 + t * dr < 0.) {
++        return float4(0.);
++      }
++    } else {
++      float discriminant = b * b - a * c;
++      if (discriminant < 0.) {
++        return float4(0.);
++      }
++      float root = sqrt(discriminant);
++      float t0 = (b - root) / a;
++      float t1 = (b + root) / a;
++      float high = max(t0, t1);
++      float low = min(t0, t1);
++      if (r0 + high * dr >= 0.) {
++        t = high;
++      } else if (r0 + low * dr >= 0.) {
++        t = low;
++      } else {
++        return float4(0.);
++      }
++    }
++  }
++  if (g.spread == 0) {
++    t = saturate(t);
++  } else if (g.spread == 2) {
++    t = t - floor(t);
++  } else {
++    float u = fmod(abs(t), 2.);
++    t = u > 1. ? 2. - u : u;
++  }
++  // (intervals are open at their end: on a hard edge, the later colour)
++  MeshGradientStopInstance previous = s[0];
++  if (t < previous.offset) {
++    return float4(previous.color[0], previous.color[1], previous.color[2], previous.color[3]);
++  }
++  for (uint i = 1; i < g.stop_count; i++) {
++    MeshGradientStopInstance stop = s[i];
++    if (t < stop.offset) {
++      float k = (t - previous.offset) / (stop.offset - previous.offset);
++      float4 from = float4(previous.color[0], previous.color[1], previous.color[2],
++                           previous.color[3]);
++      float4 to = float4(stop.color[0], stop.color[1], stop.color[2], stop.color[3]);
++      return mix(from, to, k);
++    }
++    previous = stop;
++  }
++  return last_color;
++}
++
+ // A batch of meshes is one instanced draw with an instance per block of a draw's mesh
+ // (`MeshChunk`), `block_vertices` vertices each, read from the chunk's vertex page. Vertices
+ // past the end of a draw's last block collapse to a point, so their triangles are never
+@@ -954,7 +1034,8 @@ vertex MeshVertexOutput mesh_vertex(
+   device const MeshVertex *page4 [[buffer(MeshInputIndex_Page4)]],
+   device const MeshVertex *page5 [[buffer(MeshInputIndex_Page5)]],
+   device const MeshVertex *page6 [[buffer(MeshInputIndex_Page6)]],
+-  device const MeshVertex *page7 [[buffer(MeshInputIndex_Page7)]]
++  device const MeshVertex *page7 [[buffer(MeshInputIndex_Page7)]],
++  device const MeshGradientInstance *gradients [[buffer(MeshInputIndex_Gradients)]]
+ ) {
+   MeshChunk chunk = chunks[chunk_id];
+   MeshDrawInstance draw = draws[chunk.draw];
+@@ -962,7 +1043,7 @@ vertex MeshVertexOutput mesh_vertex(
+   if (index >= draw.vertex_count) {
+     return MeshVertexOutput{
+       float4(0., 0., 0., 1.), float4(0.), float4(0.), float4(0.), float4(0.), chunk.draw,
+-      {-1., -1., -1., -1.}
++      float2(0.), {-1., -1., -1., -1.}
+     };
+   }
+ 
+@@ -992,6 +1073,11 @@ vertex MeshVertexOutput mesh_vertex(
+     draw.background.colors[0].color,
+     draw.background.colors[1].color
+   );
++  float2 gradient_position = float2(0.);
++  if (draw.gradient != 0) {
++    gradient_position = transform_point(float2(v.position[0], v.position[1]),
++                                        gradients[draw.gradient - 1].to_gradient);
++  }
+   Bounds_ScaledPixels clip = draw.clip_bounds;
+   return MeshVertexOutput{
+     device_position,
+@@ -1000,6 +1086,7 @@ vertex MeshVertexOutput mesh_vertex(
+     paint.color0,
+     paint.color1,
+     chunk.draw,
++    gradient_position,
+     {
+       position.x - clip.origin.x,
+       clip.origin.x + clip.size.width - position.x,
+@@ -1011,7 +1098,9 @@ vertex MeshVertexOutput mesh_vertex(
+ 
+ fragment float4 mesh_fragment(
+   MeshFragmentInput input [[stage_in]],
+-  device const MeshDrawInstance *draws [[buffer(MeshInputIndex_Draws)]]
++  device const MeshDrawInstance *draws [[buffer(MeshInputIndex_Draws)]],
++  device const MeshGradientInstance *gradients [[buffer(MeshInputIndex_Gradients)]],
++  device const MeshGradientStopInstance *stops [[buffer(MeshInputIndex_GradientStops)]]
+ ) {
+   MeshDrawInstance draw = draws[input.draw_id];
+   float4 paint = fill_color(
+@@ -1022,6 +1111,9 @@ fragment float4 mesh_fragment(
+     input.paint_color0,
+     input.paint_color1
+   );
++  if (draw.gradient != 0) {
++    paint *= mesh_gradient_color(gradients[draw.gradient - 1], stops, input.gradient_position);
++  }
+   float4 color = input.color * paint;
+   return float4(color.rgb * color.a, color.a);
+ }

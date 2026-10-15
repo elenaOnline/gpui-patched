@@ -1,0 +1,483 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 01:20:19 -0700
+Subject: [PATCH] gpui: Add a hatch pattern background
+
+A canvas drawing tldraw's `pattern` fill (short diagonal dashes in a
+square tile anchored to the shape) had to build the dashes as geometry:
+three round-capped strokes per tile, so a fill cost vertices in
+proportion to its area times the zoom squared, a big rectangle millions.
+
+hatch_pattern(tile, marks, to_pattern) is a Background (a new tag, like
+PatternSlash and Checkerboard) that the fragment shaders draw: three
+round-capped dashes along the descending diagonal of every unit tile of
+pattern space, in `marks` over `tile`. `to_pattern` maps window pixels to
+pattern space, so a pattern can be anchored, scaled, rotated or skewed
+with the content it fills. The dashes form a lattice, so the nearest one
+is found in constant time (two candidate rows); edges are anti-aliased
+over a device pixel, and where the dashes get thinner than a pixel the
+pattern fades to its average colour instead of aliasing. A path or quad
+filled with it costs its own vertices whatever its size.
+
+Background::hatch_filter(filter) widens the anti-aliasing footprint to
+`filter` device pixels (at least one): how the pattern looks where it
+stands for a bitmap tile that was resampled (tldraw's tiles, scaled by
+the browser between power-of-two zooms). Coverage is a box of that
+width across the nearest dash, so thin dashes lighten as they soften.
+
+The transform is kept in the fields the other tags use for parameters;
+Background::opacity leaves it alone, and paint_path and paint_quad scale
+it to device pixels.
+
+Metal, WGSL (validated by the gpui_wgpu naga tests) and HLSL
+(unvalidated) shaders are updated alike.
+---
+ crates/gpui/src/color.rs             | 141 ++++++++++++++++++++++++++-
+ crates/gpui/src/style.rs             |   3 +-
+ crates/gpui/src/window.rs            |   4 +-
+ crates/gpui_apple/src/shaders.metal  |  46 +++++++++
+ crates/gpui_wgpu/src/shaders.wgsl    |  47 +++++++++
+ crates/gpui_windows/src/shaders.hlsl |  46 +++++++++
+ 6 files changed, 280 insertions(+), 7 deletions(-)
+
+diff --git a/crates/gpui/src/color.rs b/crates/gpui/src/color.rs
+index 3bd893f..df39d01 100644
+--- a/crates/gpui/src/color.rs
++++ b/crates/gpui/src/color.rs
+@@ -747,6 +747,7 @@ pub(crate) enum BackgroundTag {
+     LinearGradient = 1,
+     PatternSlash = 2,
+     Checkerboard = 3,
++    Hatch = 4,
+ }
+ 
+ /// A color space for color interpolation.
+@@ -805,6 +806,13 @@ impl std::fmt::Debug for Background {
+                 "Checkerboard({:?}, {})",
+                 self.solid, self.gradient_angle_or_pattern_height
+             ),
++            BackgroundTag::Hatch => write!(
++                f,
++                "Hatch({:?}, {:?}, {:?})",
++                self.solid,
++                self.colors[0].color,
++                self.hatch_to_pattern()
++            ),
+         }
+     }
+ }
+@@ -847,6 +855,50 @@ pub fn checkerboard(color: impl Into<Hsla>, size: f32) -> Background {
+     }
+ }
+ 
++/// Creates a hatch pattern background: three round-capped dashes along the
++/// descending diagonal of every tile, drawn in `marks` over `tile`, the way
++/// tldraw's `pattern` fill looks.
++///
++/// `to_pattern` maps window pixels (the space element bounds and paths are
++/// given in) to pattern space, where each tile is a unit square: the dashes
++/// run from `(1/12, 3/12)` to `(3/12, 1/12)`, `(5/12, 7/12)` to `(7/12, 5/12)`
++/// and `(9/12, 11/12)` to `(11/12, 9/12)`, `5/32` wide. Anchoring, scaling and
++/// rotating the pattern with the content it fills is a matter of
++/// `to_pattern`. Edges are anti-aliased over a device pixel, and where the
++/// dashes become thinner than a device pixel the pattern fades to its average
++/// colour instead of aliasing.
++pub fn hatch_pattern(
++    tile: impl Into<Hsla>,
++    marks: impl Into<Hsla>,
++    to_pattern: crate::TransformationMatrix,
++) -> Background {
++    let [[m00, m01], [m10, m11]] = to_pattern.rotation_scale;
++    let [t0, t1] = to_pattern.translation;
++    // The pattern transform is kept in the fields the other tags use for
++    // their parameters (see `Background::hatch_to_pattern`).
++    Background {
++        tag: BackgroundTag::Hatch,
++        solid: tile.into(),
++        gradient_angle_or_pattern_height: m00,
++        colors: [
++            LinearColorStop {
++                color: marks.into(),
++                percentage: m01,
++            },
++            LinearColorStop {
++                color: Hsla {
++                    h: m10,
++                    s: m11,
++                    l: t0,
++                    a: t1,
++                },
++                percentage: 0.,
++            },
++        ],
++        ..Default::default()
++    }
++}
++
+ /// Creates a solid background color.
+ pub fn solid_background(color: impl Into<Hsla>) -> Background {
+     Background {
+@@ -929,10 +981,52 @@ impl Background {
+     pub fn opacity(&self, factor: f32) -> Self {
+         let mut background = *self;
+         background.solid = background.solid.opacity(factor);
+-        background.colors = [
+-            self.colors[0].opacity(factor),
+-            self.colors[1].opacity(factor),
+-        ];
++        background.colors[0] = self.colors[0].opacity(factor);
++        // (a hatch keeps its pattern transform there)
++        if self.tag != BackgroundTag::Hatch {
++            background.colors[1] = self.colors[1].opacity(factor);
++        }
++        background
++    }
++
++    /// A hatch pattern whose edges are anti-aliased over `filter` device pixels instead of
++    /// one (at least one): how the pattern looks when it stands for a bitmap tile of it that
++    /// was resampled (as a browser draws a pattern image scaled). Other backgrounds are
++    /// returned unchanged.
++    pub fn hatch_filter(mut self, filter: f32) -> Self {
++        if self.tag == BackgroundTag::Hatch {
++            self.colors[1].percentage = filter.max(1.);
++        }
++        self
++    }
++
++    /// The window pixels → pattern space transform of a hatch pattern.
++    pub(crate) fn hatch_to_pattern(&self) -> Option<crate::TransformationMatrix> {
++        (self.tag == BackgroundTag::Hatch).then(|| {
++            let m = self.colors[1].color;
++            crate::TransformationMatrix {
++                rotation_scale: [
++                    [
++                        self.gradient_angle_or_pattern_height,
++                        self.colors[0].percentage,
++                    ],
++                    [m.h, m.s],
++                ],
++                translation: [m.l, m.a],
++            }
++        })
++    }
++
++    /// The background for device pixels: a hatch pattern's transform takes
++    /// window pixels, scaled by `scale_factor` for the scene.
++    pub(crate) fn scale(&self, scale_factor: f32) -> Self {
++        let mut background = *self;
++        if self.tag == BackgroundTag::Hatch {
++            background.gradient_angle_or_pattern_height /= scale_factor;
++            background.colors[0].percentage /= scale_factor;
++            background.colors[1].color.h /= scale_factor;
++            background.colors[1].color.s /= scale_factor;
++        }
+         background
+     }
+ 
+@@ -943,6 +1037,9 @@ impl Background {
+             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
+             BackgroundTag::PatternSlash => self.solid.is_transparent(),
+             BackgroundTag::Checkerboard => self.solid.is_transparent(),
++            BackgroundTag::Hatch => {
++                self.solid.is_transparent() && self.colors[0].color.is_transparent()
++            }
+         }
+     }
+ }
+@@ -1067,4 +1164,40 @@ mod tests {
+         assert!((color.opacity(0.5).a - 0.4).abs() < 1e-6);
+         assert_eq!(color.opacity(2.0).a, 0.8);
+     }
++
++    #[test]
++    fn test_hatch_pattern_keeps_its_transform() {
++        let to_pattern = crate::TransformationMatrix {
++            rotation_scale: [[0.125, -0.25], [0.5, 0.0625]],
++            translation: [3.5, -7.25],
++        };
++        let tile = hsla(0.1, 0.2, 0.9, 1.0);
++        let marks = hsla(0.6, 0.8, 0.4, 1.0);
++        let hatch = hatch_pattern(tile, marks, to_pattern);
++        assert_eq!(hatch.hatch_to_pattern(), Some(to_pattern));
++        assert_eq!(solid_background(tile).hatch_to_pattern(), None);
++
++        // Opacity fades both colours but not the transform.
++        let faded = hatch.opacity(0.5);
++        assert_eq!(faded.solid.a, 0.5);
++        assert_eq!(faded.colors[0].color.a, 0.5);
++        assert_eq!(faded.hatch_to_pattern(), Some(to_pattern));
++        assert!(!hatch.is_transparent());
++        assert!(hatch.opacity(0.).is_transparent());
++
++        // In device pixels the pattern shrinks by the scale factor.
++        let device = hatch.scale(2.).hatch_to_pattern().unwrap();
++        assert_eq!(device.rotation_scale, [[0.0625, -0.125], [0.25, 0.03125]]);
++        assert_eq!(device.translation, to_pattern.translation);
++        assert_eq!(solid_background(tile).scale(2.), solid_background(tile));
++
++        // A filter softens a hatch only, and never below a device pixel; it is a count of
++        // device pixels, which scaling leaves alone.
++        let soft = hatch.hatch_filter(2.5);
++        assert_eq!(soft.colors[1].percentage, 2.5);
++        assert_eq!(soft.hatch_to_pattern(), Some(to_pattern));
++        assert_eq!(soft.scale(2.).colors[1].percentage, 2.5);
++        assert_eq!(hatch.hatch_filter(0.5).colors[1].percentage, 1.);
++        assert_eq!(solid_background(tile).hatch_filter(3.), solid_background(tile));
++    }
+ }
+diff --git a/crates/gpui/src/style.rs b/crates/gpui/src/style.rs
+index 9150fdd..3badd0d 100644
+--- a/crates/gpui/src/style.rs
++++ b/crates/gpui/src/style.rs
+@@ -716,7 +716,8 @@ impl Style {
+                 Some(color) => match color.tag {
+                     BackgroundTag::Solid
+                     | BackgroundTag::PatternSlash
+-                    | BackgroundTag::Checkerboard => color.solid,
++                    | BackgroundTag::Checkerboard
++                    | BackgroundTag::Hatch => color.solid,
+ 
+                     BackgroundTag::LinearGradient => color
+                         .colors
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 5bdfa0f..7ea64c0 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -4644,7 +4644,7 @@ impl Window {
+             order: 0,
+             bounds: snapped_bounds,
+             content_mask: self.snapped_content_mask(),
+-            background: quad.background.opacity(opacity),
++            background: quad.background.opacity(opacity).scale(self.scale_factor()),
+             border_color: quad.border_color.opacity(opacity),
+             corner_radii: quad.corner_radii.scale(self.scale_factor()),
+             border_widths: snapped_border_widths,
+@@ -4713,7 +4713,7 @@ impl Window {
+         let opacity = self.element_opacity();
+         path.content_mask = content_mask;
+         let color: Background = color.into();
+-        path.color = color.opacity(opacity);
++        path.color = color.opacity(opacity).scale(scale_factor);
+         self.next_frame
+             .scene
+             .insert_primitive(path.scale(scale_factor));
+diff --git a/crates/gpui_apple/src/shaders.metal b/crates/gpui_apple/src/shaders.metal
+index 12d2357..e944a46 100644
+--- a/crates/gpui_apple/src/shaders.metal
++++ b/crates/gpui_apple/src/shaders.metal
+@@ -62,6 +62,7 @@ struct GradientColor {
+   float4 color1;
+ };
+ GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid, Hsla color0, Hsla color1);
++float hatch_coverage(Background background, float2 position);
+ 
+ struct QuadVertexOutput {
+   uint quad_id [[flat]];
+@@ -1297,6 +1298,10 @@ GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid,
+   GradientColor out;
+   if (tag == 0 || tag == 2 || tag == 3) {
+     out.solid = hsla_to_rgba(solid);
++  } else if (tag == 4) {
++    // hatch: the tile and the marks
++    out.solid = hsla_to_rgba(solid);
++    out.color0 = hsla_to_rgba(color0);
+   } else if (tag == 1) {
+     out.color0 = hsla_to_rgba(color0);
+     out.color1 = hsla_to_rgba(color1);
+@@ -1415,7 +1420,48 @@ float4 fill_color(Background background,
+         color.a *= saturate(should_be_colored);
+         break;
+     }
++    case 4:
++      color = mix(solid_color, color0, hatch_coverage(background, position));
++      break;
+   }
+ 
+   return color;
+ }
++
++// How much the marks of a hatch background (`hatch_pattern`) cover the device pixel at
++// `position`. In pattern space every unit tile holds three round-capped dashes along its
++// descending diagonal; together the dashes form a lattice spanned by (1/3, 1/3) and (1, 0).
++// In coordinates along the ascending diagonal (d) and the dashes (e), they sit in rows
++// e = k/√2, at d = (1/3 + k + 2i/3)/√2, each half_length long and radius thick.
++float hatch_coverage(Background background, float2 position) {
++  float2 column0 = float2(background.gradient_angle_or_pattern_height, background.colors[1].color.h);
++  float2 column1 = float2(background.colors[0].percentage, background.colors[1].color.s);
++  float2 p = column0 * position.x + column1 * position.y +
++             float2(background.colors[1].color.l, background.colors[1].color.a);
++  // The size of a device pixel in pattern space, and the anti-aliasing footprint: a device
++  // pixel, or `hatch_filter` of them where the pattern stands for a resampled bitmap tile.
++  float pixel = max(length(column0), length(column1));
++  float footprint = pixel * max(background.colors[1].percentage, 1.);
++
++  const float sqrt2 = 1.41421356;
++  const float half_length = (2. / 12.) / sqrt2;
++  const float radius = 5. / 64.;
++  // The marks' share of a tile: what the pattern averages to when it's too fine to resolve.
++  const float average = 3. * (2. * half_length * 2. * radius + M_PI_F * radius * radius);
++
++  float d = (p.x + p.y) / sqrt2;
++  float e = (p.x - p.y) / sqrt2;
++  // The nearest dash is in one of the two rows around the point.
++  float distance = 1e9;
++  for (float k = floor(e * sqrt2); k <= floor(e * sqrt2) + 1.; k += 1.) {
++    float along = d * sqrt2 - 1. / 3. - k;
++    along -= round(along * 1.5) / 1.5;
++    float2 offset = float2(along / sqrt2, max(abs(e - k / sqrt2) - half_length, 0.));
++    distance = min(distance, length(offset) - radius);
++  }
++  // The share of a footprint-wide box across the nearest dash that the dash covers.
++  float h = footprint * 0.5;
++  float core = distance + radius;
++  float coverage = saturate((min(core + h, radius) - max(core - h, -radius)) / footprint);
++  return mix(coverage, average, smoothstep(2. * radius, 4. * radius, pixel));
++}
+diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
+index 40b9c0e..bfaaf65 100644
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -135,6 +135,7 @@ struct Background {
+     // 1u is LinearGradient
+     // 2u is PatternSlash
+     // 3u is Checkerboard
++    // 4u is Hatch
+     tag: u32,
+     // 0u is sRGB linear color
+     // 1u is Oklab color
+@@ -464,6 +465,10 @@ fn prepare_gradient_color(tag: u32, color_space: u32,
+ 
+     if (tag == 0u || tag == 2u || tag == 3u) {
+         result.solid = hsla_to_rgba(solid);
++    } else if (tag == 4u) {
++        // hatch: the tile and the marks
++        result.solid = hsla_to_rgba(solid);
++        result.color0 = hsla_to_rgba(colors[0].color);
+     } else if (tag == 1u) {
+         // The hsla_to_rgba is returns a linear sRGB color
+         result.color0 = hsla_to_rgba(colors[0].color);
+@@ -566,11 +571,53 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
+             background_color = solid_color;
+             background_color.a *= saturate(should_be_colored);
+         }
++        case 4u: {
++            background_color = mix(solid_color, color0, hatch_coverage(background, position));
++        }
+     }
+ 
+     return background_color;
+ }
+ 
++// How much the marks of a hatch background (`hatch_pattern`) cover the device pixel at
++// `position`. In pattern space every unit tile holds three round-capped dashes along its
++// descending diagonal; together the dashes form a lattice spanned by (1/3, 1/3) and (1, 0).
++// In coordinates along the ascending diagonal (d) and the dashes (e), they sit in rows
++// e = k/√2, at d = (1/3 + k + 2i/3)/√2, each half_length long and radius thick.
++fn hatch_coverage(background: Background, position: vec2<f32>) -> f32 {
++    let column0 = vec2<f32>(background.gradient_angle_or_pattern_height, background.colors[1].color.h);
++    let column1 = vec2<f32>(background.colors[0].percentage, background.colors[1].color.s);
++    let p = column0 * position.x + column1 * position.y
++        + vec2<f32>(background.colors[1].color.l, background.colors[1].color.a);
++    // The size of a device pixel in pattern space, and the anti-aliasing footprint: a device
++    // pixel, or `hatch_filter` of them where the pattern stands for a resampled bitmap tile.
++    let pixel = max(length(column0), length(column1));
++    let footprint = pixel * max(background.colors[1].percentage, 1.0);
++
++    let sqrt2 = 1.41421356;
++    let half_length = (2.0 / 12.0) / sqrt2;
++    let radius = 5.0 / 64.0;
++    // The marks' share of a tile: what the pattern averages to when it's too fine to resolve.
++    let average = 3.0 * (2.0 * half_length * 2.0 * radius + M_PI_F * radius * radius);
++
++    let d = (p.x + p.y) / sqrt2;
++    let e = (p.x - p.y) / sqrt2;
++    // The nearest dash is in one of the two rows around the point.
++    var distance = 1e9;
++    for (var row = 0; row < 2; row += 1) {
++        let k = floor(e * sqrt2) + f32(row);
++        var along = d * sqrt2 - 1.0 / 3.0 - k;
++        along -= round(along * 1.5) / 1.5;
++        let offset = vec2<f32>(along / sqrt2, max(abs(e - k / sqrt2) - half_length, 0.0));
++        distance = min(distance, length(offset) - radius);
++    }
++    // The share of a footprint-wide box across the nearest dash that the dash covers.
++    let h = footprint * 0.5;
++    let core = distance + radius;
++    let coverage = saturate((min(core + h, radius) - max(core - h, -radius)) / footprint);
++    return mix(coverage, average, smoothstep(2.0 * radius, 4.0 * radius, pixel));
++}
++
+ // --- quads --- //
+ 
+ struct Quad {
+diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
+index 93cacbd..24efb17 100644
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -376,6 +376,10 @@ GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, Lin
+     GradientColor output;
+     if (tag == 0 || tag == 2 || tag == 3) {
+         output.solid = hsla_to_rgba(solid);
++    } else if (tag == 4) {
++        // hatch: the tile and the marks
++        output.solid = hsla_to_rgba(solid);
++        output.color0 = hsla_to_rgba(colors[0].color);
+     } else if (tag == 1) {
+         output.color0 = hsla_to_rgba(colors[0].color);
+         output.color1 = hsla_to_rgba(colors[1].color);
+@@ -398,6 +402,45 @@ float2x2 rotate2d(float angle) {
+     return float2x2(c, -s, s, c);
+ }
+ 
++// How much the marks of a hatch background (`hatch_pattern`) cover the device pixel at
++// `position`. In pattern space every unit tile holds three round-capped dashes along its
++// descending diagonal; together the dashes form a lattice spanned by (1/3, 1/3) and (1, 0).
++// In coordinates along the ascending diagonal (d) and the dashes (e), they sit in rows
++// e = k/√2, at d = (1/3 + k + 2i/3)/√2, each half_length long and radius thick.
++float hatch_coverage(Background background, float2 position) {
++    float2 column0 = float2(background.gradient_angle_or_pattern_height, background.colors[1].color.h);
++    float2 column1 = float2(background.colors[0].percentage, background.colors[1].color.s);
++    float2 p = column0 * position.x + column1 * position.y +
++               float2(background.colors[1].color.l, background.colors[1].color.a);
++    // The size of a device pixel in pattern space, and the anti-aliasing footprint: a device
++    // pixel, or `hatch_filter` of them where the pattern stands for a resampled bitmap tile.
++    float pixel = max(length(column0), length(column1));
++    float footprint = pixel * max(background.colors[1].percentage, 1.0);
++
++    const float sqrt2 = 1.41421356;
++    const float half_length = (2.0 / 12.0) / sqrt2;
++    const float radius = 5.0 / 64.0;
++    // The marks' share of a tile: what the pattern averages to when it's too fine to resolve.
++    const float average = 3.0 * (2.0 * half_length * 2.0 * radius + M_PI_F * radius * radius);
++
++    float d = (p.x + p.y) / sqrt2;
++    float e = (p.x - p.y) / sqrt2;
++    // The nearest dash is in one of the two rows around the point.
++    float distance = 1e9;
++    for (int row = 0; row < 2; row++) {
++        float k = floor(e * sqrt2) + row;
++        float along = d * sqrt2 - 1.0 / 3.0 - k;
++        along -= round(along * 1.5) / 1.5;
++        float2 offset = float2(along / sqrt2, max(abs(e - k / sqrt2) - half_length, 0.0));
++        distance = min(distance, length(offset) - radius);
++    }
++    // The share of a footprint-wide box across the nearest dash that the dash covers.
++    float h = footprint * 0.5;
++    float core = distance + radius;
++    float coverage = saturate((min(core + h, radius) - max(core - h, -radius)) / footprint);
++    return lerp(coverage, average, smoothstep(2.0 * radius, 4.0 * radius, pixel));
++}
++
+ float4 gradient_color(Background background,
+                       float2 position,
+                       Bounds bounds,
+@@ -494,6 +537,9 @@ float4 gradient_color(Background background,
+             color.a *= saturate(should_be_colored);
+             break;
+         }
++        case 4:
++            color = lerp(solid_color, color0, hatch_coverage(background, position));
++            break;
+     }
+ 
+     return color;

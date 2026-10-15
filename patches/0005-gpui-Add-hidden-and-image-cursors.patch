@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 22:50:32 -0700
+Subject: [PATCH] gpui: Add hidden and image cursors
+
+CursorStyle only named the platform's cursors, so an app drawing its own
+cursors (a canvas with rotated resize handles, say) could neither hide
+the cursor over an element nor show an image, as CSS `cursor: none` and
+`cursor: url(...)` do.
+
+CursorStyle gets `None` and `Image(CursorImageId)`. The id stays Copy:
+App::register_cursor_image takes a CursorImage (straight RGBA, scale
+factor, hotspot in logical pixels) and returns the id, and
+App::unregister_cursor_image forgets it. On macOS the image becomes an
+NSCursor (an NSImage with a non-premultiplied NSBitmapImageRep) cached per
+id on the main thread, set through the view's cursor rects like the
+built-in cursors; None is a transparent cursor, so hiding stays per
+hitbox and never touches [NSCursor hide]'s global count. The web backend
+maps None to `none`; other backends show the arrow for both for now.
+---
+ crates/gpui/src/app.rs                  |  33 +++++--
+ crates/gpui/src/platform.rs             |  42 +++++++++
+ crates/gpui/src/window.rs               |  25 ++++++
+ crates/gpui_linux/src/linux/platform.rs |   2 +
+ crates/gpui_linux/src/linux/wayland.rs  |   2 +
+ crates/gpui_macos/src/platform.rs       |  18 ++--
+ crates/gpui_macos/src/window.rs         | 109 ++++++++++++++++++++++--
+ crates/gpui_web/src/platform.rs         |   3 +
+ 8 files changed, 215 insertions(+), 19 deletions(-)
+
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index b62cb7e..e2eb3b5 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -43,15 +43,15 @@ use crate::asset_cache::CachedLoad;
+ use crate::{
+     Action, ActionBuildError, ActionRegistry, ActivityGuard, Any, AnyView, AnyWindowHandle,
+     AppContext, Arena, ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem,
+-    ClipboardReadError, CursorStyle, DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload,
+-    FocusHandle, FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke,
+-    LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu, PathPromptOptions, Pixels, Platform,
+-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
+-    PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
+-    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
+-    Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
+-    TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowButtonLayout,
+-    WindowHandle, WindowId, WindowInvalidator,
++    ClipboardReadError, CursorImage, CursorImageId, CursorStyle, DispatchPhase, DisplayId,
++    EventEmitter, ExternalDragPayload, FocusHandle, FocusMap, ForegroundExecutor, Global,
++    KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu,
++    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
++    PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
++    PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
++    SharedString, SubscriberSet, Subscription, SvgRenderer, SystemNotification,
++    SystemNotificationResponse, Task, TextRenderingMode, TextSystem, ThermalState, Window,
++    WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
+     colors::{Colors, GlobalColors},
+     hash, init_app_menus,
+ };
+@@ -1601,6 +1601,21 @@ impl App {
+         self.platform.delete_credentials(url)
+     }
+ 
++    /// Registers a cursor image, to be shown with [`CursorStyle::Image`] like any other cursor
++    /// style (e.g. with [`Window::set_cursor_style`]). Platforms without custom cursors show the
++    /// arrow instead. Unregister images that are no longer needed.
++    pub fn register_cursor_image(&mut self, image: CursorImage) -> CursorImageId {
++        let id = CursorImageId::next();
++        self.platform.register_cursor_image(id, &image);
++        id
++    }
++
++    /// Forgets a cursor image registered with [`App::register_cursor_image`]. Where it is still
++    /// the cursor style, the arrow shows instead.
++    pub fn unregister_cursor_image(&mut self, id: CursorImageId) {
++        self.platform.unregister_cursor_image(id);
++    }
++
+     /// Directs the platform's default browser to open the given URL.
+     pub fn open_url(&self, url: &str) {
+         self.platform.open_url(url);
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 5141668..98bf0a7 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -362,6 +362,13 @@ pub trait Platform: 'static {
+ 
+     fn set_cursor_style(&self, style: CursorStyle);
+ 
++    /// Makes `image` available as [`CursorStyle::Image`] with `id`. Platforms without custom
++    /// cursors ignore it and show the arrow for it.
++    fn register_cursor_image(&self, _id: CursorImageId, _image: &CursorImage) {}
++
++    /// Forgets a cursor image registered with [`Platform::register_cursor_image`].
++    fn unregister_cursor_image(&self, _id: CursorImageId) {}
++
+     /// Hides the mouse cursor until the user moves the mouse over one of
+     /// this application's windows.
+     fn hide_cursor_until_mouse_moves(&self);
+@@ -2658,6 +2665,41 @@ pub enum CursorStyle {
+     /// A cursor indicating that the operation will result in a context menu
+     /// corresponds to the CSS cursor value `context-menu`
+     ContextualMenu,
++
++    /// No visible cursor
++    /// corresponds to the CSS cursor value `none`
++    None,
++
++    /// An image registered with [`App::register_cursor_image`](crate::App::register_cursor_image)
++    /// corresponds to a CSS `url(...)` cursor. Platforms without custom cursors show the arrow.
++    Image(CursorImageId),
++}
++
++/// Identifies a cursor image registered with
++/// [`App::register_cursor_image`](crate::App::register_cursor_image).
++#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
++pub struct CursorImageId(u64);
++
++impl CursorImageId {
++    pub(crate) fn next() -> Self {
++        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
++    }
++}
++
++/// The pixels of a custom cursor (see [`CursorStyle::Image`]).
++#[derive(Clone, Debug)]
++pub struct CursorImage {
++    /// Width in image pixels.
++    pub width: u32,
++    /// Height in image pixels.
++    pub height: u32,
++    /// Straight (not premultiplied) RGBA, 8 bits per channel, row-major, `width × height`.
++    pub rgba: Arc<[u8]>,
++    /// Image pixels per logical pixel (2 for an image drawn at @2x).
++    pub scale_factor: f32,
++    /// The point that clicks, in logical pixels from the top-left corner.
++    pub hotspot: Point<Pixels>,
+ }
+ 
+ /// A clipboard item that should be copied to the clipboard
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 3570abc..f6738b2 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -8423,6 +8423,31 @@ mod tests {
+         });
+     }
+ 
++    #[gpui::test]
++    fn test_cursor_images_get_distinct_styles(cx: &mut TestAppContext) {
++        use crate::{CursorImage, CursorStyle};
++
++        let image = CursorImage {
++            width: 1,
++            height: 1,
++            rgba: std::sync::Arc::from([0u8; 4]),
++            scale_factor: 1.,
++            hotspot: point(px(0.), px(0.)),
++        };
++        let (first, second) = cx.update(|cx| {
++            (
++                cx.register_cursor_image(image.clone()),
++                cx.register_cursor_image(image),
++            )
++        });
++        assert_ne!(CursorStyle::Image(first), CursorStyle::Image(second));
++        assert_ne!(CursorStyle::Image(first), CursorStyle::None);
++        cx.update(|cx| {
++            cx.unregister_cursor_image(first);
++            cx.unregister_cursor_image(second);
++        });
++    }
++
+     impl Render for FileDragView {
+         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+             div()
+diff --git a/crates/gpui_linux/src/linux/platform.rs b/crates/gpui_linux/src/linux/platform.rs
+index 7bf77a1..9b18977 100644
+--- a/crates/gpui_linux/src/linux/platform.rs
++++ b/crates/gpui_linux/src/linux/platform.rs
+@@ -1008,6 +1008,8 @@ pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> &'static [&'stat
+         CursorStyle::DragLink => &["alias"],
+         CursorStyle::DragCopy => &["copy"],
+         CursorStyle::ContextualMenu => &["context-menu"],
++        // Hidden and custom cursors are not supported here yet.
++        CursorStyle::None | CursorStyle::Image(_) => &[DEFAULT_CURSOR_ICON_NAME],
+     }
+ }
+ 
+diff --git a/crates/gpui_linux/src/linux/wayland.rs b/crates/gpui_linux/src/linux/wayland.rs
+index cbc962b..0b00f04 100644
+--- a/crates/gpui_linux/src/linux/wayland.rs
++++ b/crates/gpui_linux/src/linux/wayland.rs
+@@ -38,5 +38,7 @@ pub(super) fn to_shape(style: CursorStyle) -> Shape {
+         CursorStyle::DragLink => Shape::Alias,
+         CursorStyle::DragCopy => Shape::Copy,
+         CursorStyle::ContextualMenu => Shape::ContextMenu,
++        // Hidden and custom cursors are not supported here yet.
++        CursorStyle::None | CursorStyle::Image(_) => Shape::Default,
+     }
+ }
+diff --git a/crates/gpui_macos/src/platform.rs b/crates/gpui_macos/src/platform.rs
+index bda0469..4806b73 100644
+--- a/crates/gpui_macos/src/platform.rs
++++ b/crates/gpui_macos/src/platform.rs
+@@ -29,11 +29,11 @@ use ctor::ctor;
+ use dispatch2::DispatchQueue;
+ use futures::channel::oneshot;
+ use gpui::{
+-    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
+-    ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
+-    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+-    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
+-    WindowParams, popup::PopupNotSupportedError,
++    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorImage,
++    CursorImageId, CursorStyle, ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, OsMenu,
++    OwnedMenu, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
++    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Result, SystemMenuType, Task,
++    ThermalState, WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
+ };
+ use gpui_util::{ResultExt, new_std_command};
+ use itertools::Itertools;
+@@ -1132,6 +1132,14 @@ impl Platform for MacPlatform {
+         }
+     }
+ 
++    fn register_cursor_image(&self, id: CursorImageId, image: &CursorImage) {
++        crate::register_cursor_image(id, image);
++    }
++
++    fn unregister_cursor_image(&self, id: CursorImageId) {
++        crate::unregister_cursor_image(id);
++    }
++
+     fn hide_cursor_until_mouse_moves(&self) {
+         let cursor_visible = self.0.lock().cursor_visible.clone();
+         if !cursor_visible.swap(false, Ordering::Relaxed) {
+diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+index 12a75e7..6a3e11e 100644
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -24,11 +24,11 @@ use cocoa::{
+ };
+ use dispatch2::DispatchQueue;
+ use gpui::{
+-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
+-    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
+-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+-    PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
++    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorImage, CursorImageId, CursorStyle,
++    ExternalDragPayload, ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke,
++    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
++    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
++    Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
+     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
+     WindowParams, WindowVisibility, point, px, size,
+ };
+@@ -2507,6 +2507,101 @@ fn add_mouse_tracking_area(native_view: &Objc2NSView) {
+     native_view.addTrackingArea(&tracking_area);
+ }
+ 
++/// An owned (+1) `NSCursor`.
++struct OwnedCursor(id);
++
++impl Drop for OwnedCursor {
++    fn drop(&mut self) {
++        // SAFETY: `self.0` is a valid NSCursor we own one reference to.
++        unsafe {
++            let _: () = msg_send![self.0, release];
++        }
++    }
++}
++
++thread_local! {
++    // AppKit objects, used on the main thread only.
++    static CURSOR_IMAGES: std::cell::RefCell<collections::FxHashMap<CursorImageId, OwnedCursor>> =
++        std::cell::RefCell::default();
++    static HIDDEN_CURSOR: id = {
++        let image = CursorImage {
++            width: 1,
++            height: 1,
++            rgba: std::sync::Arc::from([0u8; 4]),
++            scale_factor: 1.,
++            hotspot: point(px(0.), px(0.)),
++        };
++        // Never released: it lives as long as the application.
++        // SAFETY: AppKit main-thread access (thread local of the main thread).
++        unsafe { ns_cursor(&image) }.0
++    };
++}
++
++/// An NSCursor showing `image` (+1 reference).
++///
++/// # Safety
++///
++/// Must be called on the AppKit main thread.
++unsafe fn ns_cursor(image: &CursorImage) -> OwnedCursor {
++    #[allow(non_upper_case_globals)]
++    const NSBitmapFormatAlphaNonpremultiplied: NSUInteger = 1 << 1;
++
++    let width = image.width.max(1);
++    let height = image.height.max(1);
++    let scale = if image.scale_factor > 0. {
++        image.scale_factor as f64
++    } else {
++        1.
++    };
++    let size = NSSize::new(width as f64 / scale, height as f64 / scale);
++    // SAFETY: plain AppKit object creation; the bitmap is sized for `width × height` RGBA and
++    // written within those bounds.
++    unsafe {
++        let rep: id = msg_send![class!(NSBitmapImageRep), alloc];
++        let rep: id = msg_send![rep,
++            initWithBitmapDataPlanes: ptr::null_mut::<*mut u8>()
++            pixelsWide: width as NSInteger
++            pixelsHigh: height as NSInteger
++            bitsPerSample: 8 as NSInteger
++            samplesPerPixel: 4 as NSInteger
++            hasAlpha: YES
++            isPlanar: NO
++            colorSpaceName: ns_string("NSDeviceRGBColorSpace")
++            bitmapFormat: NSBitmapFormatAlphaNonpremultiplied
++            bytesPerRow: (width * 4) as NSInteger
++            bitsPerPixel: 32 as NSInteger
++        ];
++        let data: *mut u8 = msg_send![rep, bitmapData];
++        let len = (width * height * 4) as usize;
++        if !data.is_null() && image.rgba.len() >= len {
++            ptr::copy_nonoverlapping(image.rgba.as_ptr(), data, len);
++        }
++        let _: () = msg_send![rep, setSize: size];
++        let ns_image: id = msg_send![class!(NSImage), alloc];
++        let ns_image: id = msg_send![ns_image, initWithSize: size];
++        let _: () = msg_send![ns_image, addRepresentation: rep];
++        let _: () = msg_send![rep, release];
++        let hotspot = NSPoint::new(
++            f32::from(image.hotspot.x) as f64,
++            f32::from(image.hotspot.y) as f64,
++        );
++        let cursor: id = msg_send![class!(NSCursor), alloc];
++        let cursor: id = msg_send![cursor, initWithImage: ns_image hotSpot: hotspot];
++        let _: () = msg_send![ns_image, release];
++        OwnedCursor(cursor)
++    }
++}
++
++pub(crate) fn register_cursor_image(id: CursorImageId, image: &CursorImage) {
++    // SAFETY: the platform calls this on the AppKit main thread.
++    let cursor = unsafe { ns_cursor(image) };
++    CURSOR_IMAGES.with_borrow_mut(|cursors| cursors.insert(id, cursor));
++}
++
++pub(crate) fn unregister_cursor_image(id: CursorImageId) {
++    CURSOR_IMAGES.with_borrow_mut(|cursors| cursors.remove(&id));
++}
++
+ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
+     // SAFETY: AppKit invokes cursor-rect updates on the main thread for GPUIView instances,
+     // whose WINDOW_STATE_IVAR is initialized when the view is created. The cursor registered
+@@ -2551,6 +2646,10 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
+             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
+             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
+             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
++            CursorStyle::None => HIDDEN_CURSOR.with(|cursor| *cursor),
++            CursorStyle::Image(id) => CURSOR_IMAGES
++                .with_borrow(|cursors| cursors.get(&id).map(|cursor| cursor.0))
++                .unwrap_or_else(|| msg_send![class!(NSCursor), arrowCursor]),
+         };
+ 
+         let bounds = NSView::bounds(this as *const Object as id);
+diff --git a/crates/gpui_web/src/platform.rs b/crates/gpui_web/src/platform.rs
+index d29dc34..a56b7b5 100644
+--- a/crates/gpui_web/src/platform.rs
++++ b/crates/gpui_web/src/platform.rs
+@@ -582,6 +582,9 @@ impl Platform for WebPlatform {
+             CursorStyle::DragLink => "alias",
+             CursorStyle::DragCopy => "copy",
+             CursorStyle::ContextualMenu => "context-menu",
++            CursorStyle::None => "none",
++            // Custom cursor images are not supported here yet.
++            CursorStyle::Image(_) => "default",
+         };
+ 
+         self.last_cursor_css.set(css_cursor);

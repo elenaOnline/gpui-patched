@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 21:02:24 -0700
+Subject: [PATCH] gpui: Add action listeners that are available on demand
+
+An element makes an action available by registering a listener for it while
+it paints, so a command that is only sometimes available (a menu bar item that
+greys out) had to decide its availability on every frame, whether or not
+anyone asked. An editor whose availability walks a large selection paid that
+every frame.
+
+Window::on_action_available (and the element's on_action_available) registers
+a listener with an availability predicate. It is asked when the action is
+dispatched (an unavailable listener is skipped, as if it were not registered,
+so the event goes on) and when the action's availability is queried
+(Window::is_action_available, which the menu bar's validation uses:
+DispatchTree::is_action_available_now); never while the frame is drawn.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/elements/div.rs | 40 ++++++++++++++++++++++++++
+ crates/gpui/src/key_dispatch.rs | 50 +++++++++++++++++++++++++++++++++
+ crates/gpui/src/window.rs       | 35 +++++++++++++++++++++--
+ 3 files changed, 122 insertions(+), 3 deletions(-)
+
+diff --git a/crates/gpui/src/elements/div.rs b/crates/gpui/src/elements/div.rs
+index 8fcbcac..fac1bb7 100644
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -467,6 +467,27 @@ impl Interactivity {
+         ));
+     }
+ 
++    /// Bind the given callback to an action dispatch during the bubble phase, for as long as
++    /// `available` says the action is available (asked on dispatch and when the action's
++    /// availability is queried, see [`Window::on_action_available`]).
++    /// The imperative API equivalent to [`InteractiveElement::on_action_available`].
++    pub fn on_action_available<A: Action>(
++        &mut self,
++        available: impl Fn(&App) -> bool + 'static,
++        listener: impl Fn(&A, &mut Window, &mut App) + 'static,
++    ) {
++        self.available_action_listeners.push((
++            TypeId::of::<A>(),
++            Rc::new(available),
++            Box::new(move |action, phase, window, cx| {
++                let action = action.downcast_ref().unwrap();
++                if phase == DispatchPhase::Bubble {
++                    (listener)(action, window, cx)
++                }
++            }),
++        ));
++    }
++
+     /// Bind the given callback to an action dispatch, based on a dynamic action parameter
+     /// instead of a type parameter. Useful for component libraries that want to expose
+     /// action bindings to their users.
+@@ -1105,6 +1126,19 @@ pub trait InteractiveElement: Sized {
+         self
+     }
+ 
++    /// Bind the given callback to an action dispatch during the bubble phase, for as long as
++    /// `available` says the action is available (asked when the action is dispatched and when
++    /// its availability is queried, e.g. to enable a menu item; not every frame).
++    /// The fluent API equivalent to [`Interactivity::on_action_available`].
++    fn on_action_available<A: Action>(
++        mut self,
++        available: impl Fn(&App) -> bool + 'static,
++        listener: impl Fn(&A, &mut Window, &mut App) + 'static,
++    ) -> Self {
++        self.interactivity().on_action_available(available, listener);
++        self
++    }
++
+     /// Bind the given callback to an action dispatch, based on a dynamic action parameter
+     /// instead of a type parameter. Useful for component libraries that want to expose
+     /// action bindings to their users.
+@@ -2191,6 +2225,7 @@ pub struct Interactivity {
+     pub(crate) key_up_listeners: Vec<KeyUpListener>,
+     pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
+     pub(crate) action_listeners: Vec<(TypeId, ActionListener)>,
++    pub(crate) available_action_listeners: Vec<(TypeId, Rc<dyn Fn(&App) -> bool>, ActionListener)>,
+     pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
+     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
+     pub(crate) click_listeners: Vec<ClickListener>,
+@@ -3292,6 +3327,7 @@ impl Interactivity {
+         let key_up_listeners = mem::take(&mut self.key_up_listeners);
+         let modifiers_changed_listeners = mem::take(&mut self.modifiers_changed_listeners);
+         let action_listeners = mem::take(&mut self.action_listeners);
++        let available_action_listeners = mem::take(&mut self.available_action_listeners);
+         if let Some(context) = self.key_context.clone() {
+             window.set_key_context(context);
+         }
+@@ -3317,6 +3353,10 @@ impl Interactivity {
+         for (action_type, listener) in action_listeners {
+             window.on_action(action_type, listener)
+         }
++
++        for (action_type, available, listener) in available_action_listeners {
++            window.on_action_available(action_type, available, listener)
++        }
+     }
+ 
+     fn paint_hover_group_handler(&self, window: &mut Window, cx: &mut App) {
+diff --git a/crates/gpui/src/key_dispatch.rs b/crates/gpui/src/key_dispatch.rs
+index 5db400f..561e0d7 100644
+--- a/crates/gpui/src/key_dispatch.rs
++++ b/crates/gpui/src/key_dispatch.rs
+@@ -134,6 +134,20 @@ type ModifiersChangedListener = Rc<dyn Fn(&ModifiersChangedEvent, &mut Window, &
+ pub(crate) struct DispatchActionListener {
+     pub(crate) action_type: TypeId,
+     pub(crate) listener: Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App)>,
++    /// Whether the action is available here, asked when it is dispatched or its availability
++    /// is queried (menus); `None`: always. An unavailable listener is skipped, as if it were
++    /// not registered.
++    pub(crate) available: Option<ActionAvailability>,
++}
++
++/// Whether an action listener's action is available now (see
++/// [`crate::Window::on_action_available`]).
++pub(crate) type ActionAvailability = Rc<dyn Fn(&App) -> bool>;
++
++impl DispatchActionListener {
++    pub(crate) fn is_available(&self, cx: &App) -> bool {
++        self.available.as_ref().is_none_or(|available| available(cx))
++    }
+ }
+ 
+ impl DispatchTree {
+@@ -340,6 +354,23 @@ impl DispatchTree {
+             .push(DispatchActionListener {
+                 action_type,
+                 listener,
++                available: None,
++            });
++    }
++
++    /// [`Self::on_action`] for an action that is available only while `available` says so.
++    pub(crate) fn on_action_available(
++        &mut self,
++        action_type: TypeId,
++        available: ActionAvailability,
++        listener: Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App)>,
++    ) {
++        self.active_node()
++            .action_listeners
++            .push(DispatchActionListener {
++                action_type,
++                listener,
++                available: Some(available),
+             });
+     }
+ 
+@@ -393,6 +424,25 @@ impl DispatchTree {
+         false
+     }
+ 
++    /// [`Self::is_action_available`], asking the listeners registered with an availability
++    /// ([`Self::on_action_available`]) whether they are available now.
++    pub fn is_action_available_now(
++        &self,
++        action: &dyn Action,
++        target: DispatchNodeId,
++        cx: &App,
++    ) -> bool {
++        for node_id in self.dispatch_path(target) {
++            let node = &self.nodes[node_id.0];
++            if node.action_listeners.iter().any(|listener| {
++                listener.action_type == action.as_any().type_id() && listener.is_available(cx)
++            }) {
++                return true;
++            }
++        }
++        false
++    }
++
+     /// Returns key bindings that invoke an action on the currently focused element. Bindings are
+     /// returned in the order they were added. For display, the last binding should take precedence.
+     ///
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 0700998..0990100 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -3205,7 +3205,7 @@ impl Window {
+             self.focus_node_id_in_rendered_frame(self.focused(cx).map(|handle| handle.id));
+         self.rendered_frame
+             .dispatch_tree
+-            .is_action_available(action, node_id)
++            .is_action_available_now(action, node_id, cx)
+     }
+ 
+     /// Determine whether the given action is available along the dispatch path to the given focus_handle.
+@@ -6734,10 +6734,13 @@ impl Window {
+             for DispatchActionListener {
+                 action_type,
+                 listener,
++                available,
+             } in node.action_listeners.clone()
+             {
+                 let any_action = action.as_any();
+-                if action_type == any_action.type_id() {
++                if action_type == any_action.type_id()
++                    && available.as_ref().is_none_or(|available| available(cx))
++                {
+                     #[cfg(feature = "profiler")]
+                     self.window_profiler.begin_action_handler(action, cx);
+                     listener(any_action, DispatchPhase::Capture, self, cx);
+@@ -6757,10 +6760,13 @@ impl Window {
+             for DispatchActionListener {
+                 action_type,
+                 listener,
++                available,
+             } in node.action_listeners.clone()
+             {
+                 let any_action = action.as_any();
+-                if action_type == any_action.type_id() {
++                if action_type == any_action.type_id()
++                    && available.as_ref().is_none_or(|available| available(cx))
++                {
+                     cx.propagate_event = false; // Actions stop propagation by default during the bubble phase
+                     #[cfg(feature = "profiler")]
+                     self.window_profiler.begin_action_handler(action, cx);
+@@ -7101,6 +7107,29 @@ impl Window {
+             .on_action(action_type, Rc::new(listener));
+     }
+ 
++    /// Register an action listener on this node for the next frame that is available only
++    /// while `available` returns true: it is asked when the action is dispatched (an
++    /// unavailable listener is skipped, as if it were not registered) and when the action's
++    /// availability is queried ([`Self::is_action_available`], e.g. to enable a menu item),
++    /// not while the frame is drawn, so an availability that costs something to decide costs
++    /// it only when someone asks.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn on_action_available(
++        &mut self,
++        action_type: TypeId,
++        available: Rc<dyn Fn(&App) -> bool>,
++        listener: impl Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static,
++    ) {
++        self.invalidator.debug_assert_paint();
++
++        self.next_frame.dispatch_tree.on_action_available(
++            action_type,
++            available,
++            Rc::new(listener),
++        );
++    }
++
+     /// Register a capturing action listener on this node for the next frame if the condition is true.
+     /// The type of action is determined by the first parameter of the given listener. When the next
+     /// frame is rendered the listener will be cleared.

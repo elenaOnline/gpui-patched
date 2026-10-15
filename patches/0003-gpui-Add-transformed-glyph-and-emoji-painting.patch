@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:30:17 -0700
+Subject: [PATCH] gpui: Add transformed glyph and emoji painting
+
+paint_glyph and paint_emoji always drew upright sprites, so rotated or
+skewed text had to be drawn as tessellated outlines.
+
+Window::paint_glyph_transformed and Window::paint_emoji_transformed take a
+TransformationMatrix (scaled pixels, like paint_svg's). The glyph is
+rasterized upright at the given size, through the same atlas entries as
+upright text, and the GPU transforms the sprite. Transformed glyphs are
+rasterized in grayscale, since subpixel anti-aliasing assumes upright text.
+
+Monochrome sprites get the treatment polychrome sprites got: a transformed
+sprite's quad grows by a device pixel and its edges are anti-aliased in
+its own space, which also smooths the edges of rotated SVG icons, and
+samples are clamped to the sprite's tile. Untransformed sprites keep their
+geometry.
+---
+ crates/gpui/src/window.rs            | 54 ++++++++++++++++++++++++++--
+ crates/gpui_apple/src/shaders.metal  | 33 +++++++++++------
+ crates/gpui_wgpu/src/shaders.wgsl    | 22 ++++++++----
+ crates/gpui_windows/src/shaders.hlsl | 28 +++++++++------
+ 4 files changed, 108 insertions(+), 29 deletions(-)
+
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 11c6bdc..6190283 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -4647,6 +4647,32 @@ impl Window {
+         glyph_id: GlyphId,
+         font_size: Pixels,
+         color: Hsla,
++    ) -> Result<()> {
++        self.paint_glyph_transformed(
++            origin,
++            font_id,
++            glyph_id,
++            font_size,
++            color,
++            TransformationMatrix::unit(),
++        )
++    }
++
++    /// Paints a monochrome glyph like [`Window::paint_glyph`], with `transformation` applied to it
++    /// in scaled pixels, as [`Window::paint_svg`] applies its transformation. This draws rotated,
++    /// scaled or skewed text from the glyph atlas: the glyph is rasterized upright at `font_size`
++    /// and the GPU transforms the sprite, anti-aliasing its edges. Transformed glyphs are
++    /// rasterized in grayscale, since subpixel anti-aliasing assumes upright text.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_glyph_transformed(
++        &mut self,
++        origin: Point<Pixels>,
++        font_id: FontId,
++        glyph_id: GlyphId,
++        font_size: Pixels,
++        color: Hsla,
++        transformation: TransformationMatrix,
+     ) -> Result<()> {
+         self.invalidator.debug_assert_paint();
+ 
+@@ -4665,7 +4691,8 @@ impl Window {
+             (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+         );
+         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+-        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
++        let subpixel_rendering = transformation == TransformationMatrix::unit()
++            && self.should_use_subpixel_rendering(font_id, font_size);
+         let dilation = self.text_system().glyph_dilation_for_color(color);
+         let params = RenderGlyphParams {
+             font_id,
+@@ -4711,7 +4738,7 @@ impl Window {
+                     content_mask,
+                     color: color.opacity(element_opacity),
+                     tile,
+-                    transformation: TransformationMatrix::unit(),
++                    transformation,
+                 });
+             }
+         }
+@@ -4751,6 +4778,27 @@ impl Window {
+         font_id: FontId,
+         glyph_id: GlyphId,
+         font_size: Pixels,
++    ) -> Result<()> {
++        self.paint_emoji_transformed(
++            origin,
++            font_id,
++            glyph_id,
++            font_size,
++            TransformationMatrix::unit(),
++        )
++    }
++
++    /// Paints an emoji glyph like [`Window::paint_emoji`], with `transformation` applied to it in
++    /// scaled pixels (see [`Window::paint_glyph_transformed`]).
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_emoji_transformed(
++        &mut self,
++        origin: Point<Pixels>,
++        font_id: FontId,
++        glyph_id: GlyphId,
++        font_size: Pixels,
++        transformation: TransformationMatrix,
+     ) -> Result<()> {
+         self.invalidator.debug_assert_paint();
+ 
+@@ -4794,7 +4842,7 @@ impl Window {
+                 content_mask,
+                 tile,
+                 opacity,
+-                transformation: TransformationMatrix::unit(),
++                transformation,
+             });
+         }
+         Ok(())
+diff --git a/crates/gpui_apple/src/shaders.metal b/crates/gpui_apple/src/shaders.metal
+index f34d1fe..108f822 100644
+--- a/crates/gpui_apple/src/shaders.metal
++++ b/crates/gpui_apple/src/shaders.metal
+@@ -642,6 +642,8 @@ struct MonochromeSpriteVertexOutput {
+   float2 tile_position;
+   float4 color [[flat]];
+   float4 clip_distance;
++  float2 sprite_position;
++  uint sprite_id [[flat]];
+ };
+ 
+ struct MonochromeSpriteFragmentInput {
+@@ -649,6 +651,8 @@ struct MonochromeSpriteFragmentInput {
+   float2 tile_position;
+   float4 color [[flat]];
+   float4 clip_distance;
++  float2 sprite_position;
++  uint sprite_id [[flat]];
+ };
+ 
+ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
+@@ -661,33 +665,42 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
+     [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
+   float2 unit_vertex = unit_vertices[unit_vertex_id];
+   MonochromeSprite sprite = sprites[sprite_id];
+-  float4 device_position =
+-      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+-  float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
+-                                                 sprite.content_mask.bounds, sprite.transformation);
+-  float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
++  TransformedSpriteVertex vertex_ = transformed_sprite_vertex(
++      unit_vertex, sprite.bounds, sprite.transformation, sprite.tile, viewport_size, atlas_size);
++  float4 clip_distance = distance_from_clip_rect_transformed(
++      vertex_.unit_position, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
+   float4 color = hsla_to_rgba(sprite.color);
+   return MonochromeSpriteVertexOutput{
+-      device_position,
+-      tile_position,
++      vertex_.device_position,
++      vertex_.tile_position,
+       color,
+-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
++      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
++      vertex_.sprite_position,
++      sprite_id};
+ }
+ 
+ fragment float4 monochrome_sprite_fragment(
+     MonochromeSpriteFragmentInput input [[stage_in]],
+     constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+     texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
++  MonochromeSprite sprite = sprites[input.sprite_id];
++  Corners_ScaledPixels no_corner_radii = {0., 0., 0., 0.};
++  float edge_distance =
++      transformed_quad_sdf(input.sprite_position, sprite.bounds, no_corner_radii);
+   if (any(input.clip_distance < float4(0.0))) {
+     return float4(0.0);
+   }
+ 
+   constexpr sampler atlas_texture_sampler(mag_filter::linear,
+                                           min_filter::linear);
+-  float4 sample =
+-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
++  float4 sample = atlas_texture.sample(
++      atlas_texture_sampler,
++      clamp_to_tile(input.tile_position, sprite.tile, atlas_texture));
+   float4 color = input.color;
+   color.a *= sample.a;
++  if (!is_unit_transformation(sprite.transformation)) {
++    color.a *= saturate(0.5 - edge_distance);
++  }
+   return color;
+ }
+ 
+diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
+index 05de661..699d437 100644
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -1285,33 +1285,43 @@ struct MonoSpriteVarying {
+     @location(0) tile_position: vec2<f32>,
+     @location(1) @interpolate(flat) color: vec4<f32>,
+     @location(3) clip_distances: vec4<f32>,
++    @location(4) sprite_position: vec2<f32>,
++    @location(5) @interpolate(flat) sprite_id: u32,
+ }
+ 
+ @vertex
+ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> MonoSpriteVarying {
+     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+     let sprite = load_mono_sprite(instance_id);
++    let sprite_vertex = transformed_sprite_vertex(unit_vertex, sprite.bounds, sprite.transformation, sprite.tile);
+ 
+     var out = MonoSpriteVarying();
+-    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+-
+-    out.tile_position = to_tile_position(unit_vertex, sprite.tile);
++    out.position = sprite_vertex.device_position;
++    out.tile_position = sprite_vertex.tile_position;
+     out.color = hsla_to_rgba(sprite.color);
+-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
++    out.clip_distances = distance_from_clip_rect_transformed(sprite_vertex.unit_position, sprite.bounds, sprite.content_mask, sprite.transformation);
++    out.sprite_position = sprite_vertex.sprite_position;
++    out.sprite_id = instance_id;
+     return out;
+ }
+ 
+ @fragment
+ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
+-    let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
++    let sprite = load_mono_sprite(input.sprite_id);
++    let sample = textureSample(t_sprite, s_sprite, clamp_to_tile(input.tile_position, sprite.tile)).r;
+     let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
++    let edge_distance = transformed_quad_sdf(input.sprite_position, sprite.bounds, Corners(0.0, 0.0, 0.0, 0.0));
+ 
+     // Alpha clip after using the derivatives.
+     if (any(input.clip_distances < vec4<f32>(0.0))) {
+         return vec4<f32>(0.0);
+     }
+ 
+-    return blend_color(input.color, alpha_corrected);
++    var alpha = alpha_corrected;
++    if (!is_unit_transformation(sprite.transformation)) {
++        alpha *= saturate(0.5 - edge_distance);
++    }
++    return blend_color(input.color, alpha);
+ }
+ 
+ // --- polychrome sprites --- //
+diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
+index 952d1a8..59a3eb9 100644
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -1209,6 +1209,8 @@ struct MonochromeSpriteVertexOutput {
+     float4 position: SV_Position;
+     float2 tile_position: POSITION;
+     nointerpolation float4 color: COLOR;
++    float2 sprite_position: TEXCOORD1;
++    nointerpolation uint sprite_id: TEXCOORD2;
+     float4 clip_distance: SV_ClipDistance;
+ };
+ 
+@@ -1216,6 +1218,8 @@ struct MonochromeSpriteFragmentInput {
+     float4 position: SV_Position;
+     float2 tile_position: POSITION;
+     nointerpolation float4 color: COLOR;
++    float2 sprite_position: TEXCOORD1;
++    nointerpolation uint sprite_id: TEXCOORD2;
+     float4 clip_distance: SV_ClipDistance;
+ };
+ 
+@@ -1225,23 +1229,27 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
+     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+     uint sprite_id = batch_start_index + instance_id;
+     MonochromeSprite sprite = mono_sprites[sprite_id];
+-    float4 device_position =
+-        to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+-    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+-    float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
+-    float4 color = hsla_to_rgba(sprite.color);
++    TransformedSpriteVertex sprite_vertex = transformed_sprite_vertex(unit_vertex, sprite.bounds, sprite.transformation, sprite.tile);
+ 
+     MonochromeSpriteVertexOutput output;
+-    output.position = device_position;
+-    output.tile_position = tile_position;
+-    output.color = color;
+-    output.clip_distance = clip_distance;
++    output.position = sprite_vertex.device_position;
++    output.tile_position = sprite_vertex.tile_position;
++    output.color = hsla_to_rgba(sprite.color);
++    output.sprite_position = sprite_vertex.sprite_position;
++    output.sprite_id = sprite_id;
++    output.clip_distance = distance_from_clip_rect_transformed(sprite_vertex.unit_position, sprite.bounds, sprite.content_mask, sprite.transformation);
+     return output;
+ }
+ 
+ float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
+-    float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
++    MonochromeSprite sprite = mono_sprites[input.sprite_id];
++    Corners no_corner_radii = (Corners)0;
++    float edge_distance = transformed_quad_sdf(input.sprite_position, sprite.bounds, no_corner_radii);
++    float sample = t_sprite.Sample(s_sprite, clamp_to_tile(input.tile_position, sprite.tile)).r;
+     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
++    if (!is_unit_transformation(sprite.transformation)) {
++        alpha_corrected *= saturate(0.5 - edge_distance);
++    }
+     return float4(input.color.rgb, input.color.a * alpha_corrected);
+ }
+ 

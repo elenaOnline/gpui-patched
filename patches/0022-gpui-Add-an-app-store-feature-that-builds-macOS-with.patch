@@ -1,0 +1,467 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 03:36:11 -0700
+Subject: [PATCH] gpui: Add an app-store feature that builds macOS without
+ private API
+
+App Review rejects an app whose binary uses private API (guideline 2.5.1),
+and a sandboxed store app may not start other processes (2.4.5). GPUI's
+macOS backend does both: its windows override the private
+_opaqueRectForWindowMoveWhenInTitlebar and, on their state unarchiver,
+_windowRestorationOptions (which looks up the private class
+NSWindowRestorationOptions by name); a titlebar double-click set to Fill
+sends the private _zoomFill:; the diagonal resize cursors are NSCursor's
+private _windowResizeNorthWestSouthEastCursor and
+_windowResizeNorthEastSouthWestCursor; a blurred window background hides
+AppKit's private CAChameleonLayer, strips a private CAFilter and clears
+the backgrounds of the view's private sublayers; restart() runs /bin/bash
+and open_with_system() runs `open`, which links fork, execvp and
+posix_spawnp into every app. Review scans binaries for these names,
+whether or not the code runs. GPUI also writes two undocumented defaults:
+it registers NSWindowRestoresWorkspaceAtLaunch (restoring a window before
+macOS 15) and sets NSAutoFillHeuristicControllerEnabled as the app
+launches.
+
+gpui_macos gets an `app-store` feature (and gpui_platform one that enables
+it) that compiles all of that out:
+
+- The diagonal resize cursors come from the public
+  +[NSCursor frameResizeCursorFromPosition:inDirections:] (macOS 15);
+  earlier systems, which have no public diagonal resize cursor, get the
+  crosshair.
+- open_with_system asks NSWorkspace to open the file URL, as `open` does,
+  on a background thread as before.
+- restart logs an error and does nothing: relaunching once this process
+  has exited takes a helper process.
+- Fill zooms with zoom:, without the system's tiling margins.
+- Window state restores with a plain NSKeyedUnarchiver: the frame comes
+  back, and the window opens on the current Space rather than its own.
+- AppKit drags windows from the titlebar as usual, including windows that
+  set app_owns_titlebar_drag (and it may delay their titlebar clicks, as
+  it does on macOS 27).
+- The blurred background clears only the view's own layer, and leaves
+  NSVisualEffectView to draw its sublayers as it does.
+- Neither default is written (the app may set the autofill one itself).
+
+WindowOptions::app_owns_titlebar_drag and App::restart say what the
+feature does to them. GPUI still reads the global defaults
+AppleActionOnDoubleClick (a titlebar double-click's action),
+AppleWindowTabbingMode and AppleFontSmoothing, with or without the
+feature.
+
+Without the feature nothing changes: the existing code only gains cfg
+attributes (the two gated blocks re-indented), and the unarchiver class is
+picked by a cfg-gated `let`; everything else is compiled only with the
+feature.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/app.rs            |   4 +
+ crates/gpui/src/platform.rs       |   4 +
+ crates/gpui_macos/Cargo.toml      |   5 +
+ crates/gpui_macos/src/platform.rs |  31 ++++++
+ crates/gpui_macos/src/window.rs   | 159 +++++++++++++++++++++---------
+ crates/gpui_platform/Cargo.toml   |   2 +
+ 6 files changed, 159 insertions(+), 46 deletions(-)
+
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index 42f7fad..f87f345 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -1803,6 +1803,10 @@ impl App {
+     }
+ 
+     /// Restarts the application.
++    ///
++    /// On macOS, builds with `gpui_macos`'s `app-store` feature cannot start the helper
++    /// process that reopens the application: there the restart observers run, the
++    /// platform only logs an error, and the application keeps running.
+     pub fn restart(&mut self) {
+         self.restart_observers
+             .clone()
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 342ff05..c8224af 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -2428,6 +2428,10 @@ pub struct WindowOptions {
+     /// user-movable (via their own drag) and keep the Window-menu tiling items enabled.
+     ///
+     /// Leave this `false` for windows that rely on AppKit's native titlebar dragging.
++    ///
++    /// It takes a private AppKit method, which builds with `gpui_macos`'s `app-store`
++    /// feature leave out: there it has no effect, and AppKit drags the window from its
++    /// titlebar (and may delay titlebar clicks) as for any window.
+     pub app_owns_titlebar_drag: bool,
+ 
+     /// The minimum interval between animation frames while the window is inactive.
+diff --git a/crates/gpui_macos/Cargo.toml b/crates/gpui_macos/Cargo.toml
+index 3f57a8c..6751fe7 100644
+--- a/crates/gpui_macos/Cargo.toml
++++ b/crates/gpui_macos/Cargo.toml
+@@ -19,6 +19,11 @@ test-support = ["gpui/test-support", "gpui_apple/test-support"]
+ runtime_shaders = ["gpui_apple/runtime_shaders"]
+ font-kit = ["dep:font-kit"]
+ screen-capture = ["gpui/screen-capture"]
++# Builds for the Mac App Store: no private AppKit selectors or classes, no edits
++# to AppKit's private layers, and no subprocesses. What each one did is either
++# done with public API or, where there is none, left to AppKit (see the code
++# gated on this feature).
++app-store = []
+ 
+ [dependencies]
+ gpui.workspace = true
+diff --git a/crates/gpui_macos/src/platform.rs b/crates/gpui_macos/src/platform.rs
+index 7ebf37e..c75ad96 100644
+--- a/crates/gpui_macos/src/platform.rs
++++ b/crates/gpui_macos/src/platform.rs
+@@ -36,6 +36,7 @@ use gpui::{
+     SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind, WindowParams,
+     popup::PopupNotSupportedError,
+ };
++#[cfg(not(feature = "app-store"))]
+ use gpui_util::{ResultExt, new_std_command};
+ use itertools::Itertools;
+ use objc::{
+@@ -88,6 +89,7 @@ unsafe fn build_classes() {
+         APP_DELEGATE_CLASS = {
+             let mut decl = ClassDecl::new("GPUIApplicationDelegate", class!(NSResponder)).unwrap();
+             decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
++            #[cfg(not(feature = "app-store"))]
+             decl.add_method(
+                 sel!(applicationWillFinishLaunching:),
+                 will_finish_launching as extern "C" fn(&mut Object, Sel, id),
+@@ -581,6 +583,7 @@ impl Platform for MacPlatform {
+         }
+     }
+ 
++    #[cfg(not(feature = "app-store"))]
+     fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<std::ffi::OsString>) {
+         use std::os::unix::process::CommandExt as _;
+ 
+@@ -629,6 +632,13 @@ impl Platform for MacPlatform {
+         }
+     }
+ 
++    // Relaunching after this process exits takes a helper process, which app-store builds
++    // may not start: the app keeps running, as when the script fails to start.
++    #[cfg(feature = "app-store")]
++    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {
++        log::error!("restarting is not available in app-store builds");
++    }
++
+     fn activate(&self, ignoring_other_apps: bool) {
+         unsafe {
+             let app = NSApplication::sharedApplication(nil);
+@@ -965,6 +975,7 @@ impl Platform for MacPlatform {
+         }
+     }
+ 
++    #[cfg(not(feature = "app-store"))]
+     fn open_with_system(&self, path: &Path) {
+         let path = path.to_owned();
+         self.0
+@@ -985,6 +996,24 @@ impl Platform for MacPlatform {
+             .detach();
+     }
+ 
++    // App-store builds may not run `open`; NSWorkspace does what it does (on a background
++    // thread too, as Launch Services may take a while).
++    #[cfg(feature = "app-store")]
++    fn open_with_system(&self, path: &Path) {
++        let path = path.to_owned();
++        self.0
++            .lock()
++            .background_executor
++            .spawn(async move {
++                let url = objc2_foundation::NSURL::from_file_path(&path);
++                let opened = url.is_some_and(|url| NSWorkspace::sharedWorkspace().openURL(&url));
++                if !opened {
++                    log::error!("failed to open {} with the system", path.display());
++                }
++            })
++            .detach();
++    }
++
+     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
+         self.0.lock().quit = Some(callback);
+     }
+@@ -1324,6 +1353,8 @@ unsafe fn get_mac_platform(object: &mut Object) -> &MacPlatform {
+     }
+ }
+ 
++// The default is undocumented: app-store builds leave it to the app.
++#[cfg(not(feature = "app-store"))]
+ extern "C" fn will_finish_launching(_this: &mut Object, _: Sel, _: id) {
+     unsafe {
+         let user_defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+index de6e4d7..6d0aa3a 100644
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -83,6 +83,7 @@ use std::{
+ 
+ const WINDOW_STATE_IVAR: &str = "windowState";
+ 
++#[cfg_attr(feature = "app-store", allow(dead_code))]
+ static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
+ 
+ static mut WINDOW_CLASS: *const Class = ptr::null();
+@@ -289,6 +290,9 @@ unsafe fn build_classes() {
+                 accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
+             );
+ 
++            // Private. Without it (app-store), AppKit drags the window from its titlebar
++            // as usual, including windows with `app_owns_titlebar_drag`.
++            #[cfg(not(feature = "app-store"))]
+             decl.add_method(
+                 sel!(_opaqueRectForWindowMoveWhenInTitlebar),
+                 opaque_rect_for_window_move_when_in_titlebar
+@@ -338,7 +342,8 @@ unsafe fn build_classes() {
+             );
+             decl.register()
+         };
+-        WINDOW_STATE_UNARCHIVER_CLASS = {
++        #[cfg(not(feature = "app-store"))]
++        let unarchiver_class = {
+             let mut decl =
+                 ClassDecl::new("GPUIWindowStateKeyedUnarchiver", class!(NSKeyedUnarchiver))
+                     .unwrap();
+@@ -348,6 +353,12 @@ unsafe fn build_classes() {
+             );
+             decl.register()
+         };
++        // That override is private, and so is the class it returns: app-store builds
++        // restore a window's frame with the plain unarchiver, and on macOS 15+ the
++        // window opens on the current Space rather than on its own.
++        #[cfg(feature = "app-store")]
++        let unarchiver_class = class!(NSKeyedUnarchiver);
++        WINDOW_STATE_UNARCHIVER_CLASS = unarchiver_class;
+     }
+ }
+ 
+@@ -381,6 +392,7 @@ extern "C" fn window_state_archiver_will_encode_object(
+ // Returning a default-initialized `NSWindowRestorationOptions` tells AppKit to restore the
+ // window to its original Space. This is the macOS 15+ path (FB15644170: the
+ // `NSWindowRestoresWorkspaceAtLaunch` user default no longer works there).
++#[cfg(not(feature = "app-store"))]
+ extern "C" fn window_state_unarchiver_restoration_options(_this: &Object, _sel: Sel) -> id {
+     if !is_macos_version_at_least(NSOperatingSystemVersion::new(15, 0, 0)) {
+         return nil;
+@@ -718,6 +730,8 @@ struct MacWindowState {
+     // `_opaqueRectForWindowMoveWhenInTitlebar`, so AppKit does not drag the window from
+     // the titlebar or delay titlebar clicks (a delay first observed on macOS 27). Such
+     // windows draw their own titlebar and move the window via `start_window_move`.
++    // App-store builds do not override that private method, so nothing reads it.
++    #[cfg_attr(feature = "app-store", allow(dead_code))]
+     app_owns_titlebar_drag: bool,
+     fullscreen_restore_bounds: Bounds<Pixels>,
+     is_exiting_fullscreen: bool,
+@@ -1605,7 +1619,9 @@ impl PlatformWindow for MacWindow {
+             // On macOS < 15 the `NSWindowRestoresWorkspaceAtLaunch` user default controls whether
+             // the window is restored to its original Space. On macOS 15+ that default is broken
+             // (FB15644170), and the `_windowRestorationOptions` override on our unarchiver subclass
+-            // handles it instead.
++            // handles it instead. (That default is undocumented: app-store builds leave it,
++            // and restore the frame only.)
++            #[cfg(not(feature = "app-store"))]
+             if !is_macos_version_at_least(NSOperatingSystemVersion::new(15, 0, 0)) {
+                 RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT.call_once(|| {
+                     let defaults: id = NSUserDefaults::standardUserDefaults();
+@@ -2208,13 +2224,20 @@ impl PlatformWindow for MacWindow {
+                                 if is_resizable {
+                                     // Unlike `zoom:`, AppKit's private Fill action honors the system's
+                                     // "Tiled windows have margins" setting.
+-                                    let responds_to_zoom_fill: BOOL =
+-                                        msg_send![window, respondsToSelector: sel!(_zoomFill:)];
+-                                    if responds_to_zoom_fill == YES {
+-                                        let _: () = msg_send![window, _zoomFill: nil];
+-                                    } else {
+-                                        window.zoom_(nil);
++                                    #[cfg(not(feature = "app-store"))]
++                                    {
++                                        let responds_to_zoom_fill: BOOL =
++                                            msg_send![window, respondsToSelector: sel!(_zoomFill:)];
++                                        if responds_to_zoom_fill == YES {
++                                            let _: () = msg_send![window, _zoomFill: nil];
++                                        } else {
++                                            window.zoom_(nil);
++                                        }
+                                     }
++                                    // App-store builds have only `zoom:`, which fills the
++                                    // screen without the margins.
++                                    #[cfg(feature = "app-store")]
++                                    window.zoom_(nil);
+                                 }
+                             }
+                             _ => {
+@@ -2653,12 +2676,18 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
+ 
+             // Undocumented, private class methods:
+             // https://stackoverflow.com/questions/27242353/cocoa-predefined-resize-mouse-cursor
++            #[cfg(not(feature = "app-store"))]
+             CursorStyle::ResizeUpLeftDownRight => {
+                 msg_send![class!(NSCursor), _windowResizeNorthWestSouthEastCursor]
+             }
++            #[cfg(not(feature = "app-store"))]
+             CursorStyle::ResizeUpRightDownLeft => {
+                 msg_send![class!(NSCursor), _windowResizeNorthEastSouthWestCursor]
+             }
++            #[cfg(feature = "app-store")]
++            CursorStyle::ResizeUpLeftDownRight => diagonal_resize_cursor(true),
++            #[cfg(feature = "app-store")]
++            CursorStyle::ResizeUpRightDownLeft => diagonal_resize_cursor(false),
+ 
+             CursorStyle::IBeamCursorForVerticalLayout => {
+                 msg_send![class!(NSCursor), IBeamCursorForVerticalLayout]
+@@ -2680,6 +2709,37 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
+     }
+ }
+ 
++/// The public counterpart of AppKit's private diagonal window-resize cursors:
++/// `+[NSCursor frameResizeCursorFromPosition:inDirections:]` (macOS 15) for the top-left
++/// corner (`up_left`) or the top-right one, resizing either way. Earlier systems have no
++/// public diagonal resize cursor, and get the crosshair.
++#[cfg(feature = "app-store")]
++unsafe fn diagonal_resize_cursor(up_left: bool) -> id {
++    // NSCursorFrameResizePosition and NSCursorFrameResizeDirections (NSCursor.h).
++    const TOP: NSUInteger = 1 << 0;
++    const LEFT: NSUInteger = 1 << 1;
++    const RIGHT: NSUInteger = 1 << 3;
++    const INWARD_AND_OUTWARD: NSUInteger = (1 << 0) | (1 << 1);
++    // SAFETY: NSCursor class methods returning an autoreleased cursor; the first is sent
++    // only when NSCursor answers it.
++    unsafe {
++        let available: BOOL = msg_send![
++            class!(NSCursor),
++            respondsToSelector: sel!(frameResizeCursorFromPosition:inDirections:)
++        ];
++        if available == YES {
++            let position = if up_left { TOP | LEFT } else { TOP | RIGHT };
++            msg_send![
++                class!(NSCursor),
++                frameResizeCursorFromPosition: position
++                inDirections: INWARD_AND_OUTWARD
++            ]
++        } else {
++            msg_send![class!(NSCursor), crosshairCursor]
++        }
++    }
++}
++
+ extern "C" fn handle_key_equivalent(this: &Object, _: Sel, native_event: id) -> BOOL {
+     handle_key_event(this, native_event, true)
+ }
+@@ -3738,6 +3798,7 @@ extern "C" fn accepts_first_mouse(this: &Object, _: Sel, _: id) -> BOOL {
+ // Otherwise we return an empty rect so AppKit's native titlebar dragging keeps working.
+ // This is independent of `NSWindow.isMovable`, so the Window-menu tiling items stay
+ // enabled regardless.
++#[cfg(not(feature = "app-store"))]
+ extern "C" fn opaque_rect_for_window_move_when_in_titlebar(this: &Object, _: Sel) -> NSRect {
+     let zero_rect = NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.));
+     let window_state = unsafe { get_window_state(this) };
+@@ -4097,48 +4158,54 @@ unsafe fn remove_layer_background(layer: id) {
+     unsafe {
+         let _: () = msg_send![layer, setBackgroundColor:nil];
+ 
+-        let class_name: id = msg_send![layer, className];
+-        if class_name.isEqualToString("CAChameleonLayer") {
+-            // Remove the desktop tinting effect.
+-            let _: () = msg_send![layer, setHidden: YES];
+-            return;
+-        }
++        // The layers below are AppKit's own, and private: hiding its tinting layer, editing
++        // its filters and clearing their backgrounds. App-store builds clear only the view's
++        // own layer and leave NSVisualEffectView to draw the rest as it does.
++        #[cfg(not(feature = "app-store"))]
++        {
++            let class_name: id = msg_send![layer, className];
++            if class_name.isEqualToString("CAChameleonLayer") {
++                // Remove the desktop tinting effect.
++                let _: () = msg_send![layer, setHidden: YES];
++                return;
++            }
+ 
+-        let filters: id = msg_send![layer, filters];
+-        if !filters.is_null() {
+-            // Remove the increased saturation.
+-            // The effect of a `CAFilter` or `CIFilter` is determined by its name, and the
+-            // `description` reflects its name and some parameters. Currently `NSVisualEffectView`
+-            // uses a `CAFilter` named "colorSaturate". If one day they switch to `CIFilter`, the
+-            // `description` will still contain "Saturat" ("... inputSaturation = ...").
+-            let test_string: id = ns_string("Saturat");
+-            let count = NSArray::count(filters);
+-            for i in 0..count {
+-                let description: id = msg_send![filters.objectAtIndex(i), description];
+-                let hit: BOOL = msg_send![description, containsString: test_string];
+-                if hit == NO {
+-                    continue;
+-                }
++            let filters: id = msg_send![layer, filters];
++            if !filters.is_null() {
++                // Remove the increased saturation.
++                // The effect of a `CAFilter` or `CIFilter` is determined by its name, and the
++                // `description` reflects its name and some parameters. Currently `NSVisualEffectView`
++                // uses a `CAFilter` named "colorSaturate". If one day they switch to `CIFilter`, the
++                // `description` will still contain "Saturat" ("... inputSaturation = ...").
++                let test_string: id = ns_string("Saturat");
++                let count = NSArray::count(filters);
++                for i in 0..count {
++                    let description: id = msg_send![filters.objectAtIndex(i), description];
++                    let hit: BOOL = msg_send![description, containsString: test_string];
++                    if hit == NO {
++                        continue;
++                    }
+ 
+-                let all_indices = NSRange {
+-                    location: 0,
+-                    length: count,
+-                };
+-                let indices: id = msg_send![class!(NSMutableIndexSet), indexSet];
+-                let _: () = msg_send![indices, addIndexesInRange: all_indices];
+-                let _: () = msg_send![indices, removeIndex:i];
+-                let filtered: id = msg_send![filters, objectsAtIndexes: indices];
+-                let _: () = msg_send![layer, setFilters: filtered];
+-                break;
++                    let all_indices = NSRange {
++                        location: 0,
++                        length: count,
++                    };
++                    let indices: id = msg_send![class!(NSMutableIndexSet), indexSet];
++                    let _: () = msg_send![indices, addIndexesInRange: all_indices];
++                    let _: () = msg_send![indices, removeIndex:i];
++                    let filtered: id = msg_send![filters, objectsAtIndexes: indices];
++                    let _: () = msg_send![layer, setFilters: filtered];
++                    break;
++                }
+             }
+-        }
+ 
+-        let sublayers: id = msg_send![layer, sublayers];
+-        if !sublayers.is_null() {
+-            let count = NSArray::count(sublayers);
+-            for i in 0..count {
+-                let sublayer = sublayers.objectAtIndex(i);
+-                remove_layer_background(sublayer);
++            let sublayers: id = msg_send![layer, sublayers];
++            if !sublayers.is_null() {
++                let count = NSArray::count(sublayers);
++                for i in 0..count {
++                    let sublayer = sublayers.objectAtIndex(i);
++                    remove_layer_background(sublayer);
++                }
+             }
+         }
+     }
+diff --git a/crates/gpui_platform/Cargo.toml b/crates/gpui_platform/Cargo.toml
+index 61be065..e53b8b8 100644
+--- a/crates/gpui_platform/Cargo.toml
++++ b/crates/gpui_platform/Cargo.toml
+@@ -20,6 +20,8 @@ inspector = ["gpui/inspector"]
+ test-support = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support"]
+ screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
+ runtime_shaders = ["gpui_macos/runtime_shaders"]
++# Builds for the Mac App Store (see gpui_macos).
++app-store = ["gpui_macos/app-store"]
+ wayland = ["gpui_linux/wayland"]
+ x11 = ["gpui_linux/x11"]
+ 

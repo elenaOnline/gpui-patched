@@ -1,0 +1,477 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 09:20:38 -0700
+Subject: [PATCH] gpui: Add live regions, disabled state, synthetic subtrees
+ and a11y test windows
+
+Apps built on GPUI's AccessKit integration need a few things it lacks to
+serve a screen reader well:
+
+- aria_live: a live region (StatefulInteractiveElement::aria_live). The
+  AccessKit adapters announce a live region's value when it appears and
+  when it changes (on macOS, NSAccessibilityAnnouncementRequestedNotification),
+  which is how an app tells a screen reader user what just happened
+  ("Rectangle selected") without moving focus.
+- aria_disabled: controls that cannot be used right now are reported as
+  such ("dimmed" in VoiceOver) instead of looking pressable.
+- A11ySubtreeBuilder::push_node: a synthetic subtree deeper than one
+  level (a synthetic text field with its text runs), and
+  A11ySubtreeBuilder::set_active_descendant: a custom element that keeps
+  keyboard focus itself (a canvas editing text, a list drawn by hand) can
+  report one of its synthetic children as the focused item, the
+  aria-activedescendant pattern that aria_active_descendant already gives
+  real elements. Honored only while the element or an ancestor holds
+  focus.
+- Test windows emulate the platform adapter: they keep the callbacks
+  a11y_init gives them and the tree updates the window sends, and
+  Window::simulate_a11y_activation / simulate_a11y_deactivation /
+  simulate_a11y_action / take_a11y_tree_updates let tests connect
+  assistive technology, read the trees a real adapter would receive and
+  perform actions on their nodes, headlessly.
+---
+ crates/gpui/src/elements/div.rs         | 128 ++++++++++++++++++++++++
+ crates/gpui/src/platform/test/window.rs |  57 ++++++++++-
+ crates/gpui/src/window.rs               |  40 ++++++++
+ crates/gpui/src/window/a11y.rs          | 103 +++++++++++++++++++
+ 4 files changed, 323 insertions(+), 5 deletions(-)
+
+diff --git a/crates/gpui/src/elements/div.rs b/crates/gpui/src/elements/div.rs
+index 728c233..8fcbcac 100644
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -1489,6 +1489,26 @@ pub trait StatefulInteractiveElement: InteractiveElement {
+         self
+     }
+ 
++    /// Make this element a live region (`aria-live`): assistive technology
++    /// announces its value when the element appears with a value, and
++    /// whenever its value changes, without moving focus to it.
++    ///
++    /// Put the text to announce in [`aria_value`][Self::aria_value]. To
++    /// announce the same text twice, remove the element (or clear its value)
++    /// for a frame in between, as web live regions need too.
++    fn aria_live(mut self, live: accesskit::Live) -> Self {
++        self.interactivity().aria.live = Some(live);
++        self
++    }
++
++    /// Report this element as disabled: assistive technology announces it as
++    /// dimmed or unavailable (the web's `aria-disabled`). This does not stop
++    /// its listeners from running.
++    fn aria_disabled(mut self, disabled: bool) -> Self {
++        self.interactivity().aria.disabled = disabled;
++        self
++    }
++
+     /// Register a handler for an accessibility action on this element.
+     /// The handler is called when a screen reader requests the given action.
+     ///
+@@ -2119,6 +2139,8 @@ pub(crate) struct AriaProperties {
+     pub(crate) column_index: Option<usize>,
+     pub(crate) row_count: Option<usize>,
+     pub(crate) column_count: Option<usize>,
++    pub(crate) live: Option<accesskit::Live>,
++    pub(crate) disabled: bool,
+ }
+ 
+ /// The interactivity struct. Powers all of the general-purpose
+@@ -3585,6 +3607,12 @@ impl Interactivity {
+         if let Some(count) = self.aria.column_count {
+             node.set_column_count(count);
+         }
++        if let Some(live) = self.aria.live {
++            node.set_live(live);
++        }
++        if self.aria.disabled {
++            node.set_disabled();
++        }
+         if !self.click_listeners.is_empty() {
+             node.add_action(accesskit::Action::Click);
+         }
+@@ -5286,6 +5314,106 @@ mod tests {
+         assert_eq!(node.numeric_value_step(), Some(1.0));
+     }
+ 
++    #[test]
++    fn test_live_region_and_disabled_builders() {
++        let mut element = div()
++            .id("status")
++            .aria_live(accesskit::Live::Polite)
++            .aria_value("Saved");
++        let mut node = accesskit::Node::new(accesskit::Role::Status);
++        element.interactivity().write_a11y_info(&mut node);
++        assert_eq!(node.live(), Some(accesskit::Live::Polite));
++        assert_eq!(node.value(), Some("Saved"));
++        assert!(!node.is_disabled());
++
++        let mut element = div().id("undo").aria_disabled(true);
++        let mut node = accesskit::Node::new(accesskit::Role::Button);
++        element.interactivity().write_a11y_info(&mut node);
++        assert!(node.is_disabled());
++        assert_eq!(node.live(), None);
++    }
++
++    struct A11yTestView {
++        clicks: Rc<Cell<usize>>,
++    }
++
++    impl Render for A11yTestView {
++        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
++            let clicks = self.clicks.clone();
++            div().size_full().child(
++                div()
++                    .id("save")
++                    .role(accesskit::Role::Button)
++                    .aria_label("Save")
++                    .size(px(20.))
++                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
++            )
++        }
++    }
++
++    #[gpui::test]
++    fn test_window_reports_a11y_trees_and_takes_actions(cx: &mut TestAppContext) {
++        let clicks = Rc::new(Cell::new(0));
++        let window = cx.add_window({
++            let clicks = clicks.clone();
++            move |_, _| A11yTestView { clicks }
++        });
++        let window = AnyWindowHandle::from(window);
++        let draw = |cx: &mut TestAppContext| {
++            cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
++                .unwrap();
++        };
++
++        draw(cx);
++        let updates = cx
++            .update_window(window, |_, window, _| window.take_a11y_tree_updates())
++            .unwrap();
++        assert!(
++            updates.is_empty(),
++            "no tree until assistive technology connects"
++        );
++
++        cx.update_window(window, |_, window, _| window.simulate_a11y_activation())
++            .unwrap();
++        cx.run_until_parked();
++        draw(cx);
++        let mut updates = cx
++            .update_window(window, |_, window, _| window.take_a11y_tree_updates())
++            .unwrap();
++        let update = updates.pop().expect("a tree once active");
++        let (save, node) = update
++            .nodes
++            .iter()
++            .find(|(_, node)| node.label() == Some("Save"))
++            .expect("the button's node");
++        assert_eq!(node.role(), accesskit::Role::Button);
++        assert!(node.supports_action(accesskit::Action::Click));
++
++        let save = *save;
++        cx.update_window(window, |_, window, cx| {
++            window.simulate_a11y_action(
++                accesskit::ActionRequest {
++                    action: accesskit::Action::Click,
++                    target_tree: accesskit::TreeId::ROOT,
++                    target_node: save,
++                    data: None,
++                },
++                cx,
++            )
++        })
++        .unwrap();
++        assert_eq!(clicks.get(), 1);
++
++        cx.update_window(window, |_, window, _| window.simulate_a11y_deactivation())
++            .unwrap();
++        cx.run_until_parked();
++        draw(cx);
++        let updates = cx
++            .update_window(window, |_, window, _| window.take_a11y_tree_updates())
++            .unwrap();
++        assert!(updates.is_empty(), "no trees once disconnected");
++    }
++
+     /// Two focusable, clickable elements ("a" and "b") used to exercise the
+     /// Enter/Space -> synthesized click press/release pairing.
+     struct KeyboardActivationTest {
+diff --git a/crates/gpui/src/platform/test/window.rs b/crates/gpui/src/platform/test/window.rs
+index 14fb889..2ea8d2b 100644
+--- a/crates/gpui/src/platform/test/window.rs
++++ b/crates/gpui/src/platform/test/window.rs
+@@ -1,9 +1,10 @@
+ use crate::{
+-    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, HeadlessAtlas, Pixels,
+-    PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler,
+-    PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size, TestPlatform,
+-    TextInputConfiguration, TextInputStateChange, WindowAppearance, WindowBackgroundAppearance,
+-    WindowBounds, WindowControlArea, WindowInsets, WindowParams, WindowVisibility,
++    A11yCallbacks, AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs,
++    HeadlessAtlas, Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
++    PlatformInputHandler, PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size,
++    TestPlatform, TextInputConfiguration, TextInputStateChange, WindowAppearance,
++    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
++    WindowVisibility,
+ };
+ use gpui_util::ResultExt as _;
+ #[cfg(any(test, feature = "test-support"))]
+@@ -56,6 +57,8 @@ pub(crate) struct TestWindowState {
+     appearance: WindowAppearance,
+     external_drag_files: Vec<(PathBuf, bool)>,
+     start_external_drag_result: bool,
++    a11y_callbacks: Option<Rc<A11yCallbacks>>,
++    a11y_tree_updates: Vec<accesskit::TreeUpdate>,
+ }
+ 
+ #[derive(Clone)]
+@@ -130,6 +133,8 @@ impl TestWindow {
+             appearance: WindowAppearance::Light,
+             external_drag_files: Vec::new(),
+             start_external_drag_result: false,
++            a11y_callbacks: None,
++            a11y_tree_updates: Vec::new(),
+         })))
+     }
+     pub fn simulate_scheduled_frame(&self) -> bool {
+@@ -287,6 +292,40 @@ impl TestWindow {
+     pub fn set_start_external_drag_result(&self, result: bool) {
+         self.0.lock().start_external_drag_result = result;
+     }
++
++    /// Connects assistive technology, as a screen reader starting does:
++    /// the window builds an accessibility tree from its next frame on.
++    /// Returns the tree the platform adapter is given at once (a root
++    /// placeholder until the next frame). `None` if the window has no
++    /// accessibility (see `Application::new_inaccessible`).
++    pub fn simulate_a11y_activation(&self) -> Option<accesskit::TreeUpdate> {
++        let callbacks = self.0.lock().a11y_callbacks.clone()?;
++        (callbacks.activation)()
++    }
++
++    /// Disconnects assistive technology.
++    pub fn simulate_a11y_deactivation(&self) {
++        let callbacks = self.0.lock().a11y_callbacks.clone();
++        if let Some(callbacks) = callbacks {
++            (callbacks.deactivation)();
++        }
++    }
++
++    /// Requests an action on a node, as a screen reader does (pressing a
++    /// button, focusing an item). It is handled when the foreground
++    /// executor runs next.
++    pub fn simulate_a11y_action(&self, request: accesskit::ActionRequest) {
++        let callbacks = self.0.lock().a11y_callbacks.clone();
++        if let Some(callbacks) = callbacks {
++            (callbacks.action)(request);
++        }
++    }
++
++    /// Takes the tree updates the window sent to the platform adapter since
++    /// the last call, oldest first.
++    pub fn take_a11y_tree_updates(&self) -> Vec<accesskit::TreeUpdate> {
++        std::mem::take(&mut self.0.lock().a11y_tree_updates)
++    }
+ }
+ 
+ impl PlatformWindow for TestWindow {
+@@ -556,6 +595,14 @@ impl PlatformWindow for TestWindow {
+         Some(self)
+     }
+ 
++    fn a11y_init(&self, callbacks: A11yCallbacks) {
++        self.0.lock().a11y_callbacks = Some(Rc::new(callbacks));
++    }
++
++    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
++        self.0.lock().a11y_tree_updates.push(tree_update);
++    }
++
+     #[cfg(target_os = "windows")]
+     fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND {
+         unimplemented!()
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 32cf29d..ec23570 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -7208,6 +7208,46 @@ impl Window {
+         self.a11y.debug_tree_json()
+     }
+ 
++    /// Test support: connects assistive technology to this test window, as
++    /// a screen reader starting would, and schedules a redraw, so the next
++    /// frame builds the accessibility tree and sends it to the (test)
++    /// platform adapter. Read the trees with
++    /// [`Self::take_a11y_tree_updates`].
++    #[cfg(any(test, feature = "test-support"))]
++    pub fn simulate_a11y_activation(&mut self) {
++        if let Some(test_window) = self.platform_window.as_test() {
++            test_window.simulate_a11y_activation();
++        }
++        self.refresh();
++    }
++
++    /// Test support: disconnects assistive technology from this test window.
++    #[cfg(any(test, feature = "test-support"))]
++    pub fn simulate_a11y_deactivation(&mut self) {
++        if let Some(test_window) = self.platform_window.as_test() {
++            test_window.simulate_a11y_deactivation();
++        }
++        self.refresh();
++    }
++
++    /// Test support: an action requested by assistive technology on a node
++    /// of the last tree, handled as the platform adapter's requests are
++    /// (element listeners first, then GPUI's built-in click and focus).
++    #[cfg(all(any(test, feature = "test-support"), not(target_family = "wasm")))]
++    pub fn simulate_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
++        self.handle_a11y_action(request, cx);
++    }
++
++    /// Test support: the accessibility tree updates this test window sent to
++    /// the platform adapter since the last call, oldest first.
++    #[cfg(any(test, feature = "test-support"))]
++    pub fn take_a11y_tree_updates(&mut self) -> Vec<accesskit::TreeUpdate> {
++        self.platform_window
++            .as_test()
++            .map(|test_window| test_window.take_a11y_tree_updates())
++            .unwrap_or_default()
++    }
++
+     /// Register a listener for an accessibility action on a specific node.
+     /// The listener will be called when a screen reader requests the given
+     /// action on the node identified by `node_id`.
+diff --git a/crates/gpui/src/window/a11y.rs b/crates/gpui/src/window/a11y.rs
+index 5b63821..77ff224 100644
+--- a/crates/gpui/src/window/a11y.rs
++++ b/crates/gpui/src/window/a11y.rs
+@@ -360,6 +360,48 @@ impl<'a> A11ySubtreeBuilder<'a> {
+         pushed
+     }
+ 
++    /// Add a synthetic node without making it a child of this element's node:
++    /// a deeper level of a synthetic subtree, which the caller attaches to a
++    /// synthetic child with [`accesskit::Node::set_children`] (for example
++    /// the text runs of a synthetic text field).
++    ///
++    /// Returns `false` if a node with this id is already present in the tree,
++    /// in which case the node is discarded.
++    pub fn push_node(&mut self, id: NodeId, node: accesskit::Node) -> bool {
++        let pushed = self.nodes.push_detached(id, node);
++        #[cfg(debug_assertions)]
++        if pushed {
++            self.nodes.record_node_info(
++                id,
++                debug::NodeDebugInfo {
++                    synthetic: true,
++                    view: self.creator.view,
++                    element_id: self.creator.element_id.clone(),
++                    source_location: self.creator.source_location,
++                },
++            );
++        }
++        pushed
++    }
++
++    /// Report the synthetic child `id` as the focused node, as
++    /// [`aria_active_descendant`][crate::StatefulInteractiveElement::aria_active_descendant]
++    /// does for real elements: honored only while this element or one of
++    /// its ancestors holds keyboard focus, so it is safe to call whenever
++    /// the child is the "current" item (e.g. the selected item of a
++    /// composite widget that keeps focus on its container).
++    ///
++    /// `id` must have been pushed with [`Self::push_child`] first.
++    pub fn set_active_descendant(&mut self, id: NodeId) {
++        if !self.nodes.has_node(id) {
++            debug_assert!(false, "set_active_descendant: {id:?} was not pushed");
++            return;
++        }
++        if self.nodes.focus_is_current_or_ancestor() {
++            self.nodes.set_active_descendant(id);
++        }
++    }
++
+     /// A mutable reference to the parent node.
+     pub fn parent_node(&mut self) -> &mut accesskit::Node {
+         self.nodes
+@@ -456,6 +498,18 @@ impl A11yNodeBuilder {
+         true
+     }
+ 
++    /// Add a node that is not a child of the top-of-stack node (its parent is
++    /// another synthetic node that lists it among its children).
++    ///
++    /// Returns `true` if the node was successfully pushed.
++    pub(crate) fn push_detached(&mut self, id: NodeId, node: accesskit::Node) -> bool {
++        if !self.can_push(id) {
++            return false;
++        }
++        self.all_nodes.push((id, node));
++        true
++    }
++
+     pub(crate) fn current_node_mut(&mut self) -> Option<&mut accesskit::Node> {
+         self.nodes_stack.last_mut()
+     }
+@@ -510,6 +564,14 @@ impl A11yNodeBuilder {
+         self.ids_stack[..ancestor_count].contains(&focus)
+     }
+ 
++    /// Whether the focused node is the node on top of the stack or one of
++    /// its ancestors (the gate for a synthetic child, which is never on the
++    /// stack itself, claiming the active descendant).
++    pub(crate) fn focus_is_current_or_ancestor(&self) -> bool {
++        self.focus
++            .is_some_and(|focus| self.ids_stack.contains(&focus))
++    }
++
+     pub(crate) fn set_active_descendant(&mut self, id: NodeId) {
+         if self
+             .active_descendant
+@@ -879,6 +941,47 @@ mod tests {
+         a11y.nodes.pop(); // container
+     }
+ 
++    // A focused container reports a synthetic child as the active
++    // descendant; an unfocused one cannot.
++    #[test]
++    fn synthetic_child_active_descendant_follows_container_focus() {
++        use super::A11ySubtreeBuilder;
++        for focused in [true, false] {
++            let mut a11y = new_a11y();
++            let container = NodeId(1);
++            assert!(a11y.nodes.push(container, test_node()));
++            if focused {
++                a11y.set_focusable(container, FocusId::default());
++                a11y.set_focus(container);
++            }
++            let mut builder = A11ySubtreeBuilder::new(container, &mut a11y.nodes);
++            let item = builder.synthetic_node_id("item");
++            let run = builder.synthetic_node_id("run");
++            let mut field = test_node();
++            field.set_children(vec![run]);
++            assert!(builder.push_child(item, field));
++            // a deeper level: the item's child, not the container's
++            assert!(builder.push_node(run, accesskit::Node::new(Role::TextRun)));
++            assert!(!builder.push_node(run, accesskit::Node::new(Role::TextRun)));
++            builder.set_active_descendant(item);
++            a11y.nodes.pop(); // container
++
++            let update = a11y.end_frame(Default::default());
++            let expected = if focused { item } else { ROOT_NODE_ID };
++            assert_eq!(update.focus, expected, "focused: {focused}");
++            let children = |id| {
++                update
++                    .nodes
++                    .iter()
++                    .find(|(n, _)| *n == id)
++                    .map(|(_, node)| node.children().to_vec())
++                    .unwrap_or_default()
++            };
++            assert_eq!(children(container), [item]);
++            assert_eq!(children(item), [run]);
++        }
++    }
++
+     // Node A is focused; node C (a child of the unfocused node B) claims the
+     // active descendant. The final tree must still report A as focused.
+     #[test]

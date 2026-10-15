@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 04:53:47 -0700
+Subject: [PATCH] gpui: Add Window::covered_areas_above
+
+Native views placed over an element (a web view, a video layer) draw
+above everything GPUI draws, so the UI that GPUI paints over that element
+disappears under them and cannot be clicked. covered_areas_above reports
+what the last frame drew over a hitbox: the bounds of the mouse-blocking
+hitboxes (occlude, block_mouse_except_scroll) inserted after it, and the
+painted bounds of the deferred draws (tooltips, menus and popovers, which
+paint above everything and often have no hitbox), within their content
+masks, clipped to the hitbox's area. Hosts mask their native views with it.
+---
+ crates/gpui/src/window.rs | 62 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 971fe7e..adf16fd 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -5349,6 +5349,68 @@ impl Window {
+         hitbox
+     }
+ 
++    /// The parts of `hitbox` that the last frame drew UI over: the bounds of
++    /// the mouse-blocking hitboxes inserted after it
++    /// ([`InteractiveElement::occlude`],
++    /// [`InteractiveElement::block_mouse_except_scroll`]), and of what the
++    /// deferred draws painted (tooltips, menus and popovers draw above
++    /// everything else, often without a hitbox), each within its content
++    /// mask and clipped to `hitbox`'s area. Empty when `hitbox` was not in
++    /// the last frame.
++    ///
++    /// Native views placed over an element (a web view, a video layer) are
++    /// drawn above everything GPUI draws; hosts use this to leave the UI that
++    /// covers the element visible and clickable.
++    pub fn covered_areas_above(&self, hitbox: &Hitbox) -> Vec<Bounds<Pixels>> {
++        let frame = &self.rendered_frame;
++        let Some(start) = frame.hitboxes.iter().position(|h| h.id == hitbox.id) else {
++            return Vec::new();
++        };
++        let area = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
++        let mut covered: Vec<Bounds<Pixels>> = frame.hitboxes[start + 1..]
++            .iter()
++            .filter(|h| h.behavior != HitboxBehavior::Normal)
++            .map(|h| h.bounds.intersect(&h.content_mask.bounds))
++            .collect();
++        let scale = self.scale_factor();
++        for draw in &frame.deferred_draws {
++            let range = draw.paint_range.start.scene_index..draw.paint_range.end.scene_index;
++            let painted = frame
++                .scene
++                .paint_operations
++                .get(range)
++                .unwrap_or_default()
++                .iter()
++                .filter_map(|op| match op {
++                    crate::scene::PaintOperation::Primitive(primitive) => Some(
++                        primitive
++                            .painted_bounds()
++                            .intersect(&primitive.content_mask().bounds),
++                    ),
++                    _ => None,
++                })
++                .filter(|bounds| !bounds.is_empty())
++                .reduce(|a, b| a.union(&b));
++            if let Some(painted) = painted {
++                covered.push(Bounds {
++                    origin: point(
++                        px(painted.origin.x.0 / scale),
++                        px(painted.origin.y.0 / scale),
++                    ),
++                    size: size(
++                        px(painted.size.width.0 / scale),
++                        px(painted.size.height.0 / scale),
++                    ),
++                });
++            }
++        }
++        covered
++            .into_iter()
++            .map(|bounds| bounds.intersect(&area))
++            .filter(|bounds| !bounds.is_empty())
++            .collect()
++    }
++
+     /// Set a hitbox which will act as a control area of the platform window.
+     ///
+     /// This method should only be called as part of the paint phase of element drawing.

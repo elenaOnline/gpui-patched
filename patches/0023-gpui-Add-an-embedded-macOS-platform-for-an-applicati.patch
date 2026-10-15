@@ -1,0 +1,582 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 03:37:26 -0700
+Subject: [PATCH] gpui: Add an embedded macOS platform for an application that
+ owns NSApp
+
+Application::run_embedded exists for a GPUI app whose run loop belongs to
+someone else ("a GPUI view hosted inside a foreign native application"),
+but on macOS the platform cannot be hosted: MacPlatform::run makes
+GPUIApplication the shared application, installs its own delegate, writes
+the platform pointer into both, sets the activation policy and blocks in
+[NSApp run]. A native application that owns NSApp (its class, delegate,
+menus and run loop) and shows some windows with GPUI cannot use it.
+
+MacPlatform::new_embedded (gpui_platform::embedded_application) makes a
+platform, in an Rc since running it hands its address to Objective-C,
+whose run never touches NSApp: not its class, delegate, ivars, activation
+policy or run loop. It calls the launch callback and returns, so
+run_embedded hands the host an ApplicationHandle; the host starts it once
+it has finished launching, and only once. GPUI's notifications (keyboard
+layout, thermal state, sleep and wake) go to an observer, a
+GPUIApplicationDelegate that is never NSApp's delegate, which carries the
+platform ivar; the platform removes it from both notification centres,
+clears its ivar and releases it when dropped. The notifications are
+subscribed by the code that did it in applicationDidFinishLaunching:, now
+a function both use.
+
+What belongs to the application is the host's: set_menus only keeps the
+menus for get_menus, set_dock_menu does nothing, system notifications do
+nothing (GPUI never takes over the UNUserNotificationCenter's delegate or
+categories), and the delegate's handlers (should-quit, quit, reopen, open
+URLs, the app menu's) are not called; the host calls what it needs, such
+as App::shutdown when it terminates. What acts on the application (quit,
+restart, activate, hide, the appearance, simple fullscreen's presentation
+options) acts on the host's; new_embedded's documentation lists it.
+Windows, events, text input, cursors and dispatching to the main thread
+already use only public NSApplication API, whoever created NSApp, and need
+no change.
+
+Since an embedded platform can go away before the process does, the
+thermal, sleep and wake handlers no longer queue the platform's address
+for the main queue: they queue the observer, retained, and the queued
+work looks the platform up on the main thread (thermal notifications
+arrive on any thread) and does nothing if it has gone. Every delegate
+handler now does nothing when there is no platform, where it asserted
+(and so aborted the process, a panic in an extern "C" function).
+
+For an application GPUI runs, the other changes: run no longer writes the
+platform ivar into an NSApp that is not a GPUIApplication
+(sharedApplication returns an NSApp created before it, which has no such
+ivar, so run used to panic there; only the delegate's ivar is ever read);
+set_menus, set_dock_menu, ensure_system_power_observers and the system
+notification functions check `embedded` first; MacPlatform has a Drop,
+which does nothing unless it was embedded; and the deferred handlers
+retain and release the delegate around the queued work.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui_macos/src/platform.rs         | 293 ++++++++++++++++++----
+ crates/gpui_platform/src/gpui_platform.rs |   8 +
+ 2 files changed, 248 insertions(+), 53 deletions(-)
+
+diff --git a/crates/gpui_macos/src/platform.rs b/crates/gpui_macos/src/platform.rs
+index c75ad96..ff75a89 100644
+--- a/crates/gpui_macos/src/platform.rs
++++ b/crates/gpui_macos/src/platform.rs
+@@ -211,6 +211,11 @@ pub(crate) struct MacPlatformState {
+     /// Mirrors `[NSCursor setHiddenUntilMouseMoves:]` state, which AppKit doesn't expose.
+     cursor_visible: Arc<AtomicBool>,
+     system_notifications: crate::system_notifications::SystemNotificationState,
++    /// Hosted by an application that owns `NSApp` ([`MacPlatform::new_embedded`]).
++    embedded: bool,
++    /// Embedded, once running: a `GPUIApplicationDelegate` that is never `NSApp`'s delegate.
++    /// It carries the `platform` ivar and receives the notifications GPUI observes.
++    embedded_observer: Option<id>,
+ }
+ 
+ impl MacPlatform {
+@@ -261,10 +266,65 @@ impl MacPlatform {
+             keyboard_mapper,
+             cursor_visible: Arc::new(AtomicBool::new(true)),
+             system_notifications: crate::system_notifications::SystemNotificationState::new(),
++            embedded: false,
++            embedded_observer: None,
+         });
+         Self(state, marker)
+     }
+ 
++    /// A platform for GPUI inside a native application that owns `NSApp`: its class and
++    /// delegate, the menu bar and Dock menu, the activation policy, quitting and the run
++    /// loop. `Application::run_embedded` then runs its callback at once and returns; call
++    /// it once, when the host has finished launching. The platform is behind an `Rc`
++    /// because running it gives its address to Objective-C, so it must not move.
++    ///
++    /// Windows, input, text, cursors and the main-thread executor work as in a GPUI
++    /// application. What belongs to the application is the host's:
++    ///
++    /// - `set_menus` only keeps the menus for `get_menus` (the host may build its menu bar
++    ///   from them), and `set_dock_menu` does nothing.
++    /// - GPUI's application delegate is not installed, so the handlers set with
++    ///   `on_should_quit`, `on_quit`, `on_reopen`, `on_open_urls` and the app menu ones are
++    ///   never called: the host calls what it needs (`App::shutdown` when it terminates,
++    ///   say). So `App::quit` does not ask `on_should_quit` first; the host's delegate
++    ///   answers instead. Nor is the `NSAutoFillHeuristicControllerEnabled` default that
++    ///   GPUI's delegate sets as the application launches set.
++    /// - System notifications are the host's too: `show_system_notification`,
++    ///   `dismiss_system_notification` and `on_system_notification_response` do nothing,
++    ///   so GPUI never becomes the `UNUserNotificationCenter`'s delegate or replaces its
++    ///   notification categories.
++    ///
++    /// What acts on the application acts on the host's: `quit` asks it to terminate;
++    /// `activate`, `hide`, `hide_other_apps`, `unhide_other_apps` and `reply_to_should_quit`
++    /// act on its `NSApp`; `set_window_appearance` sets the appearance of all its windows;
++    /// a window in simple fullscreen sets its `presentationOptions` while it is. `restart`
++    /// asks it to terminate and starts a helper process that opens it again once it has
++    /// exited (if the host cancels, whenever it exits later); with the `app-store` feature
++    /// `restart` only logs an error.
++    pub fn new_embedded() -> Rc<Self> {
++        let platform = Self::new(false);
++        platform.0.lock().embedded = true;
++        Rc::new(platform)
++    }
++
++    fn run_embedded(&self, on_finish_launching: Box<dyn FnOnce()>) {
++        assert!(
++            self.0.lock().embedded_observer.is_none(),
++            "an embedded platform runs once"
++        );
++        // NSApp is the host's: not a `GPUIApplication`, and without a `platform` ivar.
++        // SAFETY: `APP_DELEGATE_CLASS` is registered at startup and declares the ivar and
++        // the notification handlers. The platform is in an `Rc` (`new_embedded`), so its
++        // address is stable, and `Drop` clears the ivar before it goes.
++        unsafe {
++            let observer: id = msg_send![APP_DELEGATE_CLASS, new];
++            (*observer).set_ivar(MAC_PLATFORM_IVAR, self as *const Self as *const c_void);
++            self.0.lock().embedded_observer = Some(observer);
++            register_app_observers(&mut *observer);
++        }
++        on_finish_launching();
++    }
++
+     unsafe fn create_menu_bar(
+         &self,
+         menus: &Vec<Menu>,
+@@ -504,6 +564,20 @@ impl MacPlatform {
+         if self.0.lock().system_power_observers_registered {
+             return;
+         }
++        let (embedded, embedded_observer) = {
++            let state = self.0.lock();
++            (state.embedded, state.embedded_observer)
++        };
++        if embedded {
++            // NSApp's delegate is the host's; before `run` there is no observer yet, and
++            // `run` registers these if they are wanted by then.
++            if let Some(observer) = embedded_observer {
++                // SAFETY: the observer is a live object as long as the platform is.
++                register_system_power_observers(unsafe { &*(observer as *const AnyObject) });
++                self.0.lock().system_power_observers_registered = true;
++            }
++            return;
++        }
+ 
+         // The shared application must be created through `APP_CLASS`, or `run`
+         // finds a plain `NSApplication` without the `platform` ivar; only the
+@@ -536,6 +610,10 @@ impl Platform for MacPlatform {
+ 
+     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+         let mut state = self.0.lock();
++        if state.embedded {
++            drop(state);
++            return self.run_embedded(on_finish_launching);
++        }
+         if state.headless {
+             drop(state);
+             on_finish_launching();
+@@ -551,14 +629,21 @@ impl Platform for MacPlatform {
+             app.setDelegate_(app_delegate);
+ 
+             let self_ptr = self as *const Self as *const c_void;
+-            (*app).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
++            // An NSApp created before this (`sharedApplication` returns it) is not a
++            // `GPUIApplication` and has no such ivar to write.
++            let is_gpui_app: BOOL = msg_send![app, isKindOfClass: APP_CLASS];
++            if is_gpui_app == YES {
++                (*app).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
++            }
+             (*app_delegate).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
+ 
+             let pool = NSAutoreleasePool::new(nil);
+             app.run();
+             pool.drain();
+ 
+-            (*app).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
++            if is_gpui_app == YES {
++                (*app).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
++            }
+             (*NSWindow::delegate(app)).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
+         }
+     }
+@@ -1087,12 +1172,19 @@ impl Platform for MacPlatform {
+ 
+     fn show_system_notification(&self, notification: gpui::SystemNotification) {
+         let mut state = self.0.lock();
++        if state.embedded {
++            log::warn!("system notifications are the host application's");
++            return;
++        }
+         let executor = state.foreground_executor.clone();
+         state.system_notifications.show(&executor, notification);
+     }
+ 
+     fn dismiss_system_notification(&self, tag: &str) {
+         let mut state = self.0.lock();
++        if state.embedded {
++            return;
++        }
+         let executor = state.foreground_executor.clone();
+         state.system_notifications.dismiss(&executor, tag);
+     }
+@@ -1102,6 +1194,9 @@ impl Platform for MacPlatform {
+         callback: Box<dyn FnMut(gpui::SystemNotificationResponse)>,
+     ) {
+         let mut state = self.0.lock();
++        if state.embedded {
++            return;
++        }
+         let executor = state.foreground_executor.clone();
+         state.system_notifications.on_response(&executor, callback);
+     }
+@@ -1123,6 +1218,11 @@ impl Platform for MacPlatform {
+     }
+ 
+     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap) {
++        if self.0.lock().embedded {
++            // The menu bar is the host's.
++            self.0.lock().menus = Some(menus.into_iter().map(|menu| menu.owned()).collect());
++            return;
++        }
+         unsafe {
+             let app: id = msg_send![APP_CLASS, sharedApplication];
+             let mut state = self.0.lock();
+@@ -1139,6 +1239,10 @@ impl Platform for MacPlatform {
+     }
+ 
+     fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap) {
++        if self.0.lock().embedded {
++            // The Dock menu is the host's.
++            return;
++        }
+         unsafe {
+             let app: id = msg_send![APP_CLASS, sharedApplication];
+             let mut state = self.0.lock();
+@@ -1338,6 +1442,26 @@ impl Platform for MacPlatform {
+     }
+ }
+ 
++impl Drop for MacPlatform {
++    fn drop(&mut self) {
++        // An embedded platform's observer points at it: stop its notifications, clear the
++        // pointer (work already queued for the main thread holds the observer, and finds no
++        // platform) and release it.
++        if let Some(observer) = self.0.get_mut().embedded_observer.take() {
++            // SAFETY: the observer was created by `run_embedded` and is owned here.
++            unsafe {
++                let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
++                let _: () = msg_send![center, removeObserver: observer];
++                NSWorkspace::sharedWorkspace()
++                    .notificationCenter()
++                    .removeObserver(&*(observer as *const AnyObject));
++                (*observer).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
++                let _: () = msg_send![observer, release];
++            }
++        }
++    }
++}
++
+ unsafe fn path_from_objc(path: id) -> PathBuf {
+     let len = msg_send![path, lengthOfBytesUsingEncoding: NSUTF8StringEncoding];
+     let bytes = unsafe { path.UTF8String() as *const u8 };
+@@ -1345,11 +1469,46 @@ unsafe fn path_from_objc(path: id) -> PathBuf {
+     PathBuf::from(path)
+ }
+ 
+-unsafe fn get_mac_platform(object: &mut Object) -> &MacPlatform {
++/// The platform a `GPUIApplicationDelegate` carries: none before `run` sets it, once `run`
++/// has returned, or once an embedded platform was dropped.
++///
++/// # Safety
++///
++/// Main thread only (the ivar is written there, and the platform lives there).
++unsafe fn get_mac_platform(object: &Object) -> Option<&MacPlatform> {
+     unsafe {
+         let platform_ptr: *mut c_void = *object.get_ivar(MAC_PLATFORM_IVAR);
+-        assert!(!platform_ptr.is_null());
+-        &*(platform_ptr as *const MacPlatform)
++        (platform_ptr as *const MacPlatform).as_ref()
++    }
++}
++
++/// Runs `work` on the main queue with `this` (a `GPUIApplicationDelegate`) as its context,
++/// retained until then; `work` takes it with [`take_deferred_platform`]. For notifications
++/// that may arrive on any thread, or while the app is borrowed.
++///
++/// # Safety
++///
++/// `this` must be a `GPUIApplicationDelegate`.
++unsafe fn defer_to_main_queue(this: &Object, work: extern "C" fn(*mut c_void)) {
++    unsafe {
++        let observer: id = msg_send![this, retain];
++        DispatchQueue::main().exec_async_f(observer as *mut c_void, work);
++    }
++}
++
++/// In work queued by [`defer_to_main_queue`] (on the main thread): releases the observer
++/// and returns the platform it carries, if it still carries one. An embedded platform
++/// may have been dropped since the work was queued.
++///
++/// # Safety
++///
++/// `context` must be the context [`defer_to_main_queue`] passed, taken once.
++unsafe fn take_deferred_platform<'a>(context: *mut c_void) -> Option<&'a MacPlatform> {
++    unsafe {
++        let observer = context as id;
++        let platform = get_mac_platform(&*observer).map(|p| p as *const MacPlatform);
++        let _: () = msg_send![observer, release];
++        platform.map(|p| &*p)
+     }
+ }
+ 
+@@ -1377,6 +1536,21 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
+         let app: id = msg_send![APP_CLASS, sharedApplication];
+         app.setActivationPolicy_(NSApplicationActivationPolicyRegular);
+ 
++        register_app_observers(this);
++        let Some(platform) = get_mac_platform(this) else {
++            return;
++        };
++        let callback = platform.0.lock().finish_launching.take();
++        if let Some(callback) = callback {
++            callback();
++        }
++    }
++}
++
++/// Subscribes `this`, a `GPUIApplicationDelegate` with its `platform` ivar set (`NSApp`'s
++/// delegate, or an embedded platform's observer), to the notifications GPUI observes.
++unsafe fn register_app_observers(this: &mut Object) {
++    unsafe {
+         let notification_center: *mut Object =
+             msg_send![class!(NSNotificationCenter), defaultCenter];
+         let name = ns_string("NSTextInputContextKeyboardSelectionDidChangeNotification");
+@@ -1396,25 +1570,22 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
+ 
+         // SAFETY: `this` is a live Objective-C object; only the pointer's type changes.
+         let observer = &*(this as *mut Object as *const AnyObject);
+-        let platform = get_mac_platform(this);
+-        let callback = {
+-            let mut state = platform.0.lock();
+-            if (state.on_system_sleep.is_some() || state.on_system_wake.is_some())
+-                && !state.system_power_observers_registered
+-            {
+-                register_system_power_observers(observer);
+-                state.system_power_observers_registered = true;
+-            }
+-            state.finish_launching.take()
++        let Some(platform) = get_mac_platform(this) else {
++            return;
+         };
+-        if let Some(callback) = callback {
+-            callback();
++        let mut state = platform.0.lock();
++        if (state.on_system_sleep.is_some() || state.on_system_wake.is_some())
++            && !state.system_power_observers_registered
++        {
++            register_system_power_observers(observer);
++            state.system_power_observers_registered = true;
+         }
+     }
+ }
+ 
+-/// `observer` must be the app delegate, whose class declares `onSystemSleep:`
+-/// and `onSystemWake:` (see `build_classes`).
++/// `observer` must be a `GPUIApplicationDelegate` (the app delegate, or an embedded
++/// platform's observer), whose class declares `onSystemSleep:` and `onSystemWake:`
++/// (see `build_classes`).
+ fn register_system_power_observers(observer: &AnyObject) {
+     let center = NSWorkspace::sharedWorkspace().notificationCenter();
+     // SAFETY: both selectors are declared on the delegate class with the
+@@ -1437,7 +1608,9 @@ fn register_system_power_observers(observer: &AnyObject) {
+ 
+ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_windows: bool) {
+     if !has_open_windows {
+-        let platform = unsafe { get_mac_platform(this) };
++        let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.reopen.take() {
+             drop(lock);
+@@ -1454,7 +1627,9 @@ extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
+     const NS_TERMINATE_CANCEL: NSUInteger = 0;
+     const NS_TERMINATE_NOW: NSUInteger = 1;
+     const NS_TERMINATE_LATER: NSUInteger = 2;
+-    let platform = unsafe { get_mac_platform(this) };
++    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++        return NS_TERMINATE_NOW;
++    };
+     let mut lock = platform.0.lock();
+     let Some(mut callback) = lock.should_quit.take() else {
+         return NS_TERMINATE_NOW;
+@@ -1470,7 +1645,9 @@ extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
+ }
+ 
+ extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
+-    let platform = unsafe { get_mac_platform(this) };
++    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++        return;
++    };
+     let mut lock = platform.0.lock();
+     if let Some(mut callback) = lock.quit.take() {
+         drop(lock);
+@@ -1480,7 +1657,9 @@ extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
+ }
+ 
+ extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
+-    let platform = unsafe { get_mac_platform(this) };
++    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++        return;
++    };
+     let mut lock = platform.0.lock();
+     let keyboard_layout = MacKeyboardLayout::new();
+     lock.keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
+@@ -1498,15 +1677,17 @@ extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
+ extern "C" fn on_thermal_state_change(this: &mut Object, _: Sel, _: id) {
+     // Defer to the next run loop iteration to avoid re-entrant borrows of the App RefCell,
+     // as NSNotificationCenter delivers this notification synchronously and it may fire while
+-    // the App is already borrowed (same pattern as quit() above).
+-    let platform = unsafe { get_mac_platform(this) };
+-    let platform_ptr = platform as *const MacPlatform as *mut c_void;
+-    unsafe {
+-        DispatchQueue::main().exec_async_f(platform_ptr, on_thermal_state_change);
+-    }
++    // the App is already borrowed (same pattern as quit() above). It may also arrive on
++    // another thread: the platform is only looked up on the main one.
++    // SAFETY: this is a `GPUIApplicationDelegate` (the app delegate or an embedded
++    // platform's observer).
++    unsafe { defer_to_main_queue(this, on_thermal_state_change) };
+ 
+     extern "C" fn on_thermal_state_change(context: *mut c_void) {
+-        let platform = unsafe { &*(context as *const MacPlatform) };
++        // SAFETY: queued by `defer_to_main_queue` above; runs on the main queue.
++        let Some(platform) = (unsafe { take_deferred_platform(context) }) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.on_thermal_state_change.take() {
+             drop(lock);
+@@ -1524,17 +1705,15 @@ extern "C" fn on_thermal_state_change(this: &mut Object, _: Sel, _: id) {
+ // machine keeps running the main run loop for well over a frame after the
+ // observers return, so the block runs before it suspends.
+ extern "C" fn on_system_sleep(this: &mut Object, _: Sel, _: id) {
+-    // SAFETY: this is the registered app delegate carrying MAC_PLATFORM_IVAR.
+-    let platform = unsafe { get_mac_platform(this) };
+-    let platform_ptr = platform as *const MacPlatform as *mut c_void;
+-    // SAFETY: platform lives for the process lifetime while callbacks are registered.
+-    unsafe {
+-        DispatchQueue::main().exec_async_f(platform_ptr, on_system_sleep);
+-    }
++    // SAFETY: this is a `GPUIApplicationDelegate` (the app delegate or an embedded
++    // platform's observer).
++    unsafe { defer_to_main_queue(this, on_system_sleep) };
+ 
+     extern "C" fn on_system_sleep(context: *mut c_void) {
+-        // SAFETY: context is the MacPlatform pointer queued above.
+-        let platform = unsafe { &*(context as *const MacPlatform) };
++        // SAFETY: queued by `defer_to_main_queue` above; runs on the main queue.
++        let Some(platform) = (unsafe { take_deferred_platform(context) }) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.on_system_sleep.take() {
+             drop(lock);
+@@ -1545,17 +1724,15 @@ extern "C" fn on_system_sleep(this: &mut Object, _: Sel, _: id) {
+ }
+ 
+ extern "C" fn on_system_wake(this: &mut Object, _: Sel, _: id) {
+-    // SAFETY: this is the registered app delegate carrying MAC_PLATFORM_IVAR.
+-    let platform = unsafe { get_mac_platform(this) };
+-    let platform_ptr = platform as *const MacPlatform as *mut c_void;
+-    // SAFETY: platform lives for the process lifetime while callbacks are registered.
+-    unsafe {
+-        DispatchQueue::main().exec_async_f(platform_ptr, on_system_wake);
+-    }
++    // SAFETY: this is a `GPUIApplicationDelegate` (the app delegate or an embedded
++    // platform's observer).
++    unsafe { defer_to_main_queue(this, on_system_wake) };
+ 
+     extern "C" fn on_system_wake(context: *mut c_void) {
+-        // SAFETY: context is the MacPlatform pointer queued above.
+-        let platform = unsafe { &*(context as *const MacPlatform) };
++        // SAFETY: queued by `defer_to_main_queue` above; runs on the main queue.
++        let Some(platform) = (unsafe { take_deferred_platform(context) }) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.on_system_wake.take() {
+             drop(lock);
+@@ -1580,7 +1757,9 @@ extern "C" fn open_urls(this: &mut Object, _: Sel, _: id, urls: id) {
+             })
+             .collect::<Vec<_>>()
+     };
+-    let platform = unsafe { get_mac_platform(this) };
++    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++        return;
++    };
+     let mut lock = platform.0.lock();
+     if let Some(mut callback) = lock.open_urls.take() {
+         drop(lock);
+@@ -1591,7 +1770,9 @@ extern "C" fn open_urls(this: &mut Object, _: Sel, _: id, urls: id) {
+ 
+ extern "C" fn handle_menu_item(this: &mut Object, _: Sel, item: id) {
+     unsafe {
+-        let platform = get_mac_platform(this);
++        let Some(platform) = get_mac_platform(this) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.menu_command.take() {
+             let tag: NSInteger = msg_send![item, tag];
+@@ -1609,7 +1790,9 @@ extern "C" fn handle_menu_item(this: &mut Object, _: Sel, item: id) {
+ extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
+     unsafe {
+         let mut result = false;
+-        let platform = get_mac_platform(this);
++        let Some(platform) = get_mac_platform(this) else {
++            return result;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.validate_menu_command.take() {
+             let tag: NSInteger = msg_send![item, tag];
+@@ -1631,7 +1814,9 @@ extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
+ 
+ extern "C" fn menu_will_open(this: &mut Object, _: Sel, _: id) {
+     unsafe {
+-        let platform = get_mac_platform(this);
++        let Some(platform) = get_mac_platform(this) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.will_open_menu.take() {
+             drop(lock);
+@@ -1643,7 +1828,9 @@ extern "C" fn menu_will_open(this: &mut Object, _: Sel, _: id) {
+ 
+ extern "C" fn handle_dock_menu(this: &mut Object, _: Sel, _: id) -> id {
+     unsafe {
+-        let platform = get_mac_platform(this);
++        let Some(platform) = get_mac_platform(this) else {
++            return nil;
++        };
+         let state = platform.0.lock();
+         if let Some(id) = state.dock_menu {
+             id
+diff --git a/crates/gpui_platform/src/gpui_platform.rs b/crates/gpui_platform/src/gpui_platform.rs
+index b95e609..1c0bc0d 100644
+--- a/crates/gpui_platform/src/gpui_platform.rs
++++ b/crates/gpui_platform/src/gpui_platform.rs
+@@ -20,6 +20,14 @@ pub fn application() -> gpui::Application {
+     gpui::Application::with_platform(current_platform(false))
+ }
+ 
++/// GPUI inside a native macOS application that owns `NSApp` (its delegate, menus,
++/// activation policy, quitting and run loop). Start it with `Application::run_embedded`
++/// once the host has finished launching; see `gpui_macos::MacPlatform::new_embedded`.
++#[cfg(target_os = "macos")]
++pub fn embedded_application() -> gpui::Application {
++    gpui::Application::with_platform(gpui_macos::MacPlatform::new_embedded())
++}
++
+ pub fn headless() -> gpui::Application {
+     gpui::Application::with_platform(current_platform(true))
+ }

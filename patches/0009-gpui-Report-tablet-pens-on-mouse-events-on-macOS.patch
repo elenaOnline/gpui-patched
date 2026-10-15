@@ -1,0 +1,944 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 04:16:53 -0700
+Subject: [PATCH] gpui: Report tablet pens on mouse events on macOS
+
+Mouse events had no way to tell a tablet's pen from a mouse, so drawing
+apps could not read pen pressure. MouseDownEvent, MouseUpEvent and
+MouseMoveEvent now carry `pen: Option<PenInfo>`: the tip pressure
+(0..=1, 0 while hovering), the tilt in degrees and whether the eraser
+end is in use, with the values and ranges of the web's PointerEvent for
+`pointerType: "pen"`. Mice, trackpads and other platforms report `None`.
+
+On macOS a mouse event is a pen's when its subtype is a tablet point or
+tablet proximity, as Chromium decides (RenderWidgetHostViewCocoa
+-mouseEvent:); pressure and tilt come from the tablet-point fields
+(WebMouseEventBuilder::Build). Which end of the pen is in use is only in
+proximity events, so the window remembers it from them (both the
+NSEventTypeTabletProximity events some drivers send, now received via
+-tabletProximity:, and the proximity subtype of mouse events).
+
+A pen leaving the proximity reports MouseExited: it points nowhere,
+and Chromium sends pointerleave for it.
+
+Pen presses and releases with control held keep their button (the
+left-to-right conversion for control-clicks applies to mice and
+trackpads): a tablet reports the tip or eraser pressed with control, as
+web engines do, and pens have their own right button.
+---
+ crates/gpui/src/app/test_app.rs               |   3 +
+ crates/gpui/src/app/test_context.rs           |   5 +
+ crates/gpui/src/app/visual_test_context.rs    |   3 +
+ crates/gpui/src/elements/div.rs               |   5 +
+ crates/gpui/src/gestures.rs                   |   2 +
+ crates/gpui/src/interactive.rs                |  31 +++
+ crates/gpui/src/window.rs                     |  14 +
+ crates/gpui_linux/src/linux/wayland/client.rs |   4 +
+ crates/gpui_linux/src/linux/x11/client.rs     |   3 +
+ crates/gpui_macos/src/events.rs               | 256 +++++++++++++++++-
+ crates/gpui_macos/src/window.rs               |  23 +-
+ crates/gpui_web/src/events.rs                 |   3 +
+ crates/gpui_windows/src/events.rs             |   6 +
+ 13 files changed, 353 insertions(+), 5 deletions(-)
+
+diff --git a/crates/gpui/src/app/test_app.rs b/crates/gpui/src/app/test_app.rs
+index bf265fd..108d302 100644
+--- a/crates/gpui/src/app/test_app.rs
++++ b/crates/gpui/src/app/test_app.rs
+@@ -414,6 +414,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
+             position,
+             modifiers: Default::default(),
+             pressed_button: None,
++            pen: None,
+         });
+     }
+ 
+@@ -425,6 +426,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
+             modifiers: Default::default(),
+             click_count: 1,
+             first_mouse: false,
++            pen: None,
+         });
+     }
+ 
+@@ -435,6 +437,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
+             button,
+             modifiers: Default::default(),
+             click_count: 1,
++            pen: None,
+         });
+     }
+ 
+diff --git a/crates/gpui/src/app/test_context.rs b/crates/gpui/src/app/test_context.rs
+index a4c9fb6..c528a96 100644
+--- a/crates/gpui/src/app/test_context.rs
++++ b/crates/gpui/src/app/test_context.rs
+@@ -901,6 +901,7 @@ impl VisualTestContext {
+             position,
+             modifiers,
+             pressed_button: button.into(),
++            pen: None,
+         })
+     }
+ 
+@@ -917,6 +918,7 @@ impl VisualTestContext {
+             button,
+             click_count: 1,
+             first_mouse: false,
++            pen: None,
+         })
+     }
+ 
+@@ -932,6 +934,7 @@ impl VisualTestContext {
+             modifiers,
+             button,
+             click_count: 1,
++            pen: None,
+         })
+     }
+ 
+@@ -943,12 +946,14 @@ impl VisualTestContext {
+             button: MouseButton::Left,
+             click_count: 1,
+             first_mouse: false,
++            pen: None,
+         });
+         self.simulate_event(MouseUpEvent {
+             position,
+             modifiers,
+             button: MouseButton::Left,
+             click_count: 1,
++            pen: None,
+         });
+     }
+ 
+diff --git a/crates/gpui/src/app/visual_test_context.rs b/crates/gpui/src/app/visual_test_context.rs
+index b54802a..b5763c8 100644
+--- a/crates/gpui/src/app/visual_test_context.rs
++++ b/crates/gpui/src/app/visual_test_context.rs
+@@ -267,6 +267,7 @@ impl VisualTestAppContext {
+                 position,
+                 modifiers,
+                 pressed_button: button.into(),
++                pen: None,
+             },
+         );
+     }
+@@ -287,6 +288,7 @@ impl VisualTestAppContext {
+                 button,
+                 click_count: 1,
+                 first_mouse: false,
++                pen: None,
+             },
+         );
+     }
+@@ -306,6 +308,7 @@ impl VisualTestAppContext {
+                 modifiers,
+                 button,
+                 click_count: 1,
++                pen: None,
+             },
+         );
+     }
+diff --git a/crates/gpui/src/elements/div.rs b/crates/gpui/src/elements/div.rs
+index c32ac99..728c233 100644
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -4740,6 +4740,7 @@ mod tests {
+                     modifiers: Default::default(),
+                     click_count: 1,
+                     first_mouse: false,
++                    pen: None,
+                 }
+                 .to_platform_input(),
+                 cx,
+@@ -4756,6 +4757,7 @@ mod tests {
+                     button: MouseButton::Left,
+                     modifiers: Default::default(),
+                     click_count: 1,
++                    pen: None,
+                 }
+                 .to_platform_input(),
+                 cx,
+@@ -5007,6 +5009,7 @@ mod tests {
+                         position: point(px(10.), px(10.)),
+                         modifiers: Default::default(),
+                         pressed_button: None,
++                        pen: None,
+                     }
+                     .to_platform_input(),
+                     cx,
+@@ -5153,6 +5156,7 @@ mod tests {
+                         position: point(px(75.), px(75.)),
+                         modifiers: Default::default(),
+                         pressed_button: None,
++                        pen: None,
+                     }
+                     .to_platform_input(),
+                     cx,
+@@ -5205,6 +5209,7 @@ mod tests {
+                             modifiers: Default::default(),
+                             click_count: 1,
+                             first_mouse: false,
++                            pen: None,
+                         }
+                         .to_platform_input(),
+                         cx,
+diff --git a/crates/gpui/src/gestures.rs b/crates/gpui/src/gestures.rs
+index ec61157..1c14271 100644
+--- a/crates/gpui/src/gestures.rs
++++ b/crates/gpui/src/gestures.rs
+@@ -755,12 +755,14 @@ impl TouchGestureRecognizer {
+                             modifiers: Modifiers::default(),
+                             click_count: tap_count,
+                             first_mouse: false,
++                            pen: None,
+                         },
+                         up: MouseUpEvent {
+                             button: MouseButton::Left,
+                             position: event.position,
+                             modifiers: Modifiers::default(),
+                             click_count: tap_count,
++                            pen: None,
+                         },
+                     });
+                 }
+diff --git a/crates/gpui/src/interactive.rs b/crates/gpui/src/interactive.rs
+index 913cf1b..7218160 100644
+--- a/crates/gpui/src/interactive.rs
++++ b/crates/gpui/src/interactive.rs
+@@ -143,6 +143,25 @@ impl InputEvent for TouchEvent {
+     }
+ }
+ 
++/// Stylus details of a mouse event that a pen produced (a graphics
++/// tablet's stylus, or a pencil used as one), with the values and ranges
++/// of the web's `PointerEvent` for `pointerType: "pen"`.
++///
++/// Mouse events from mice and trackpads carry no `PenInfo`, and neither do
++/// events on platforms that don't report pens yet (only macOS does).
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct PenInfo {
++    /// The normalized tip pressure in `0.0..=1.0`; `0.0` while the pen
++    /// hovers over the tablet without touching it.
++    pub pressure: f32,
++    /// The pen's tilt in degrees, each axis in `-90.0..=90.0`: `x` is
++    /// positive when the pen leans to the right, `y` when it leans towards
++    /// the user (the web's `tiltX` and `tiltY`).
++    pub tilt: Point<f32>,
++    /// Whether the eraser end of the pen produced the event.
++    pub eraser: bool,
++}
++
+ /// A mouse down event from the platform
+ #[derive(Clone, Debug, Default)]
+ pub struct MouseDownEvent {
+@@ -160,6 +179,10 @@ pub struct MouseDownEvent {
+ 
+     /// Whether this is the first, focusing click.
+     pub first_mouse: bool,
++
++    /// The pen's state, when a pen pressed its tip (or a button) rather
++    /// than a mouse or trackpad.
++    pub pen: Option<PenInfo>,
+ }
+ 
+ impl Sealed for MouseDownEvent {}
+@@ -194,6 +217,10 @@ pub struct MouseUpEvent {
+ 
+     /// The number of times the button has been clicked.
+     pub click_count: usize,
++
++    /// The pen's state, when a pen lifted its tip (or released a button)
++    /// rather than a mouse or trackpad.
++    pub pen: Option<PenInfo>,
+ }
+ 
+ impl Sealed for MouseUpEvent {}
+@@ -500,6 +527,10 @@ pub struct MouseMoveEvent {
+ 
+     /// The modifiers that were held down when the mouse was moved.
+     pub modifiers: Modifiers,
++
++    /// The pen's state, when a pen moved (hovering or touching) rather
++    /// than a mouse or trackpad.
++    pub pen: Option<PenInfo>,
+ }
+ 
+ impl Sealed for MouseMoveEvent {}
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 7ea64c0..971fe7e 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -5716,6 +5716,7 @@ impl Window {
+                         position,
+                         pressed_button: Some(MouseButton::Left),
+                         modifiers: Modifiers::default(),
++                        pen: None,
+                     })
+                 }
+                 FileDropEvent::Pending { position } => {
+@@ -5724,6 +5725,7 @@ impl Window {
+                         position,
+                         pressed_button: Some(MouseButton::Left),
+                         modifiers: Modifiers::default(),
++                        pen: None,
+                     })
+                 }
+                 FileDropEvent::Submit { position } => {
+@@ -5734,6 +5736,7 @@ impl Window {
+                         position,
+                         modifiers: Modifiers::default(),
+                         click_count: 1,
++                        pen: None,
+                     })
+                 }
+                 FileDropEvent::Exited => {
+@@ -7080,12 +7083,14 @@ impl Window {
+                         modifiers: Modifiers::default(),
+                         click_count: 1,
+                         first_mouse: false,
++                        pen: None,
+                     });
+                     let mouse_up = PlatformInput::MouseUp(MouseUpEvent {
+                         button: MouseButton::Left,
+                         position: center,
+                         modifiers: Modifiers::default(),
+                         click_count: 1,
++                        pen: None,
+                     });
+                     self.dispatch_event(mouse_down, cx);
+                     self.dispatch_event(mouse_up, cx);
+@@ -7324,6 +7329,7 @@ impl Window {
+             position,
+             modifiers: self.modifiers,
+             pressed_button: None,
++            pen: None,
+         });
+         let _ = self.dispatch_event(event, cx);
+     }
+@@ -8751,6 +8757,7 @@ mod tests {
+                         modifiers: Default::default(),
+                         click_count: 1,
+                         first_mouse: false,
++                        pen: None,
+                     }
+                     .to_platform_input(),
+                     cx,
+@@ -8760,6 +8767,7 @@ mod tests {
+                         position: point(px(20.), px(20.)),
+                         pressed_button: Some(MouseButton::Left),
+                         modifiers: Default::default(),
++                        pen: None,
+                     }
+                     .to_platform_input(),
+                     cx,
+@@ -8788,6 +8796,7 @@ mod tests {
+                     position: outside_position,
+                     pressed_button: Some(MouseButton::Left),
+                     modifiers: Default::default(),
++                    pen: None,
+                 }
+                 .to_platform_input(),
+                 cx,
+@@ -8968,6 +8977,7 @@ mod tests {
+                     position: outside_position,
+                     pressed_button: Some(MouseButton::Left),
+                     modifiers: Default::default(),
++                    pen: None,
+                 }
+                 .to_platform_input(),
+                 cx,
+@@ -9005,6 +9015,7 @@ mod tests {
+                     position: outside_position,
+                     pressed_button: Some(MouseButton::Left),
+                     modifiers: Default::default(),
++                    pen: None,
+                 }
+                 .to_platform_input(),
+                 cx,
+@@ -9027,6 +9038,7 @@ mod tests {
+                         position: point(px(x_position), px(20.)),
+                         pressed_button: Some(MouseButton::Left),
+                         modifiers: Default::default(),
++                        pen: None,
+                     }
+                     .to_platform_input(),
+                     cx,
+@@ -9696,6 +9708,7 @@ mod inspector_tests {
+                         modifiers: Modifiers::default(),
+                         click_count: 1,
+                         first_mouse: false,
++                        pen: None,
+                     }),
+                     cx,
+                 );
+@@ -9705,6 +9718,7 @@ mod inspector_tests {
+                         button: MouseButton::Left,
+                         modifiers: Modifiers::default(),
+                         click_count: 1,
++                        pen: None,
+                     }),
+                     cx,
+                 );
+diff --git a/crates/gpui_linux/src/linux/wayland/client.rs b/crates/gpui_linux/src/linux/wayland/client.rs
+index 469eb44..f5f9a20 100644
+--- a/crates/gpui_linux/src/linux/wayland/client.rs
++++ b/crates/gpui_linux/src/linux/wayland/client.rs
+@@ -2222,6 +2222,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
+                         position,
+                         pressed_button: None,
+                         modifiers,
++                        pen: None,
+                     }));
+                 }
+             }
+@@ -2290,6 +2291,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
+                         position: state.mouse_location.unwrap(),
+                         pressed_button: state.button_pressed,
+                         modifiers: state.modifiers,
++                        pen: None,
+                     });
+                     drop(state);
+                     window.handle_input(input);
+@@ -2360,6 +2362,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
+                                 modifiers: state.modifiers,
+                                 click_count: state.click.current_count,
+                                 first_mouse: state.enter_token.take().is_some(),
++                                pen: None,
+                             });
+                             drop(state);
+                             window.handle_input(input);
+@@ -2374,6 +2377,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
+                                 position: state.mouse_location.unwrap(),
+                                 modifiers: state.modifiers,
+                                 click_count: state.click.current_count,
++                                pen: None,
+                             });
+                             drop(state);
+                             window.handle_input(input);
+diff --git a/crates/gpui_linux/src/linux/x11/client.rs b/crates/gpui_linux/src/linux/x11/client.rs
+index 23a9a91..e981808 100644
+--- a/crates/gpui_linux/src/linux/x11/client.rs
++++ b/crates/gpui_linux/src/linux/x11/client.rs
+@@ -1209,6 +1209,7 @@ impl X11Client {
+                             modifiers,
+                             click_count: current_count,
+                             first_mouse: false,
++                            pen: None,
+                         }));
+                     }
+                     Some(ButtonOrScroll::Scroll(direction)) => {
+@@ -1254,6 +1255,7 @@ impl X11Client {
+                             position,
+                             modifiers,
+                             click_count,
++                            pen: None,
+                         }));
+                     }
+                     Some(ButtonOrScroll::Scroll(_)) => {}
+@@ -1305,6 +1307,7 @@ impl X11Client {
+                         position,
+                         pressed_button,
+                         modifiers,
++                        pen: None,
+                     }));
+                 }
+ 
+diff --git a/crates/gpui_macos/src/events.rs b/crates/gpui_macos/src/events.rs
+index 37857fe..0462297 100644
+--- a/crates/gpui_macos/src/events.rs
++++ b/crates/gpui_macos/src/events.rs
+@@ -1,7 +1,7 @@
+ use gpui::{
+     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
+     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
+-    NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
++    NavigationDirection, PenInfo, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
+     ScrollWheelEvent, TouchPhase, point, px,
+ };
+ 
+@@ -11,7 +11,7 @@ use crate::{
+ };
+ use cocoa::{
+     appkit::{NSEvent, NSEventModifierFlags, NSEventPhase, NSEventType},
+-    base::{YES, id},
++    base::{BOOL, NO, YES, id},
+ };
+ use core_foundation::data::{CFDataGetBytePtr, CFDataRef};
+ use core_graphics::event::CGKeyCode;
+@@ -116,9 +116,114 @@ fn touch_phase(phase: NSEventPhase) -> TouchPhase {
+     }
+ }
+ 
++/// `NSEventSubtype` of a mouse event a tablet's pen produced.
++const NS_EVENT_SUBTYPE_TABLET_POINT: i16 = 1;
++/// `NSEventSubtype` of a mouse event that also reports a pen entering or
++/// leaving the tablet's proximity.
++const NS_EVENT_SUBTYPE_TABLET_PROXIMITY: i16 = 2;
++/// `NSPointingDeviceTypeEraser`: the eraser end of a pen.
++const NS_POINTING_DEVICE_TYPE_ERASER: u64 = 3;
++/// What a window remembers about the tablet between events: proximity
++/// events say which end of the pen is in use, the mouse events that follow
++/// don't. Chromium keeps the same state per view
++/// (`RenderWidgetHostViewCocoa`'s `_pointerType`, set from proximity events
++/// in `-tabletEvent:` and `-mouseEvent:`), and reports pen and eraser alike
++/// as `pointerType: "pen"`.
++#[derive(Clone, Copy, Debug, Default)]
++pub(crate) struct TabletState {
++    /// The eraser end of the pen is in proximity.
++    pub eraser: bool,
++}
++
++impl TabletState {
++    /// Notes a proximity event: `NSEventTypeTabletProximity`, or a mouse
++    /// event of subtype `NSEventSubtypeTabletProximity`.
++    ///
++    /// # Safety
++    ///
++    /// `native_event` must be a valid `NSEvent` that carries proximity
++    /// information.
++    pub(crate) unsafe fn note_proximity(&mut self, native_event: id) {
++        let device: u64 = unsafe { msg_send![native_event, pointingDeviceType] };
++        self.eraser = device == NS_POINTING_DEVICE_TYPE_ERASER;
++    }
++}
++
++/// Whether a pen's mouse event reports it leaving the tablet's proximity.
++///
++/// # Safety
++///
++/// `native_event` must be a valid mouse `NSEvent` ([`is_mouse_event`]).
++unsafe fn leaves_proximity(native_event: id) -> bool {
++    unsafe {
++        let subtype: i16 = msg_send![native_event, subtype];
++        if subtype != NS_EVENT_SUBTYPE_TABLET_PROXIMITY {
++            return false;
++        }
++        let entering: BOOL = msg_send![native_event, isEnteringProximity];
++        entering == NO
++    }
++}
++
++fn is_mouse_event(event_type: NSEventType) -> bool {
++    matches!(
++        event_type,
++        NSEventType::NSLeftMouseDown
++            | NSEventType::NSLeftMouseUp
++            | NSEventType::NSRightMouseDown
++            | NSEventType::NSRightMouseUp
++            | NSEventType::NSOtherMouseDown
++            | NSEventType::NSOtherMouseUp
++            | NSEventType::NSMouseMoved
++            | NSEventType::NSLeftMouseDragged
++            | NSEventType::NSRightMouseDragged
++            | NSEventType::NSOtherMouseDragged
++    )
++}
++
++/// The pen details of a mouse event, `None` unless a tablet's pen produced
++/// it. Chromium builds a pen `PointerEvent` from the same fields
++/// (`WebMouseEventBuilder::Build` in
++/// `components/input/web_input_event_builders_mac.mm`): pressure from
++/// `-[NSEvent pressure]` for subtype `NSEventSubtypeTabletPoint` only, tilt
++/// as `-[NSEvent tilt]` × 90°, with y negated for an unflipped view so that
++/// it is positive towards the user.
++///
++/// # Safety
++///
++/// `native_event` must be a valid mouse `NSEvent` ([`is_mouse_event`]):
++/// `-subtype` raises for other event types.
++unsafe fn pen_info(native_event: id, tablet: &mut TabletState) -> Option<PenInfo> {
++    unsafe {
++        let subtype: i16 = msg_send![native_event, subtype];
++        match subtype {
++            NS_EVENT_SUBTYPE_TABLET_POINT => {
++                let tilt = native_event.tilt();
++                Some(PenInfo {
++                    pressure: native_event.pressure().clamp(0.0, 1.0),
++                    tilt: point(
++                        (tilt.x * 90.0).clamp(-90.0, 90.0) as f32,
++                        (-tilt.y * 90.0).clamp(-90.0, 90.0) as f32,
++                    ),
++                    eraser: tablet.eraser,
++                })
++            }
++            NS_EVENT_SUBTYPE_TABLET_PROXIMITY => {
++                tablet.note_proximity(native_event);
++                Some(PenInfo {
++                    eraser: tablet.eraser,
++                    ..PenInfo::default()
++                })
++            }
++            _ => None,
++        }
++    }
++}
++
+ pub(crate) unsafe fn platform_input_from_native(
+     native_event: id,
+     window_height: Option<Pixels>,
++    tablet: &mut TabletState,
+ ) -> Option<PlatformInput> {
+     unsafe {
+         let event_type = native_event.eventType();
+@@ -132,6 +237,32 @@ pub(crate) unsafe fn platform_input_from_native(
+             _ => {}
+         }
+ 
++        // A pen entering or leaving the tablet's proximity (sent on its own
++        // by some tablet drivers, instead of as a mouse event's subtype).
++        if matches!(event_type, NSEventType::NSTabletProximity) {
++            tablet.note_proximity(native_event);
++            return None;
++        }
++        let pen = if is_mouse_event(event_type) {
++            pen_info(native_event, tablet)
++        } else {
++            None
++        };
++        // The pen left the tablet's proximity: it no longer points anywhere
++        // (Chromium sends `pointerleave` for it).
++        if pen.is_some() && leaves_proximity(native_event) {
++            return window_height.map(|window_height| {
++                PlatformInput::MouseExited(MouseExitEvent {
++                    position: point(
++                        px(native_event.locationInWindow().x as f32),
++                        window_height - px(native_event.locationInWindow().y as f32),
++                    ),
++                    pressed_button: None,
++                    modifiers: read_modifiers(native_event),
++                })
++            });
++        }
++
+         match event_type {
+             NSEventType::NSFlagsChanged => {
+                 Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+@@ -174,6 +305,7 @@ pub(crate) unsafe fn platform_input_from_native(
+                         modifiers: read_modifiers(native_event),
+                         click_count: native_event.clickCount() as usize,
+                         first_mouse: false,
++                        pen,
+                     })
+                 })
+             }
+@@ -199,6 +331,7 @@ pub(crate) unsafe fn platform_input_from_native(
+                         ),
+                         modifiers: read_modifiers(native_event),
+                         click_count: native_event.clickCount() as usize,
++                        pen,
+                     })
+                 })
+             }
+@@ -244,6 +377,7 @@ pub(crate) unsafe fn platform_input_from_native(
+                             modifiers: read_modifiers(native_event),
+                             click_count: 1,
+                             first_mouse: false,
++                            pen: None,
+                         })
+                     }),
+                     _ => None,
+@@ -309,6 +443,7 @@ pub(crate) unsafe fn platform_input_from_native(
+                             window_height - px(native_event.locationInWindow().y as f32),
+                         ),
+                         modifiers: read_modifiers(native_event),
++                        pen,
+                     })
+                 })
+             }
+@@ -320,6 +455,7 @@ pub(crate) unsafe fn platform_input_from_native(
+                     ),
+                     pressed_button: None,
+                     modifiers: read_modifiers(native_event),
++                    pen,
+                 })
+             }),
+             NSEventType::NSMouseExited => window_height.map(|window_height| {
+@@ -589,4 +725,120 @@ mod tests {
+         assert_eq!(touch_phase(NSEventPhase::NSEventPhaseEnded), TouchPhase::Ended);
+         assert_eq!(touch_phase(NSEventPhase::NSEventPhaseCancelled), TouchPhase::Cancelled);
+     }
++
++    /// A tablet mouse event as a tablet driver sends it (built, never
++    /// posted): subtype, pressure and tilt fields on a CGEvent.
++    fn tablet_event(
++        event_type: core_graphics::event::CGEventType,
++        subtype: i64,
++        fields: &[(core_graphics::event::CGEventField, f64)],
++    ) -> id {
++        use core_graphics::event::{CGEvent, CGMouseButton, EventField};
++        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
++        use foreign_types::ForeignType;
++        use objc::class;
++        let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
++        let event = CGEvent::new_mouse_event(
++            source,
++            event_type,
++            core_graphics::geometry::CGPoint::new(10.0, 20.0),
++            CGMouseButton::Left,
++        )
++        .unwrap();
++        event.set_integer_value_field(EventField::MOUSE_EVENT_SUB_TYPE, subtype);
++        for (field, value) in fields {
++            if *field == EventField::TABLET_PROXIMITY_EVENT_POINTER_TYPE
++                || *field == EventField::TABLET_PROXIMITY_EVENT_ENTER_PROXIMITY
++            {
++                event.set_integer_value_field(*field, *value as i64);
++            } else {
++                event.set_double_value_field(*field, *value);
++            }
++        }
++        unsafe { msg_send![class!(NSEvent), eventWithCGEvent: event.as_ptr()] }
++    }
++
++    #[test]
++    fn tablet_pens_on_mouse_events() {
++        use core_graphics::event::{CGEventType, EventField};
++        let window_height = Some(px(100.0));
++        let mut tablet = TabletState::default();
++        let point = |subtype, event_type| {
++            tablet_event(
++                event_type,
++                subtype,
++                &[
++                    (EventField::MOUSE_EVENT_PRESSURE, 0.625),
++                    (EventField::TABLET_EVENT_TILT_X, 0.5),
++                    (EventField::TABLET_EVENT_TILT_Y, -0.25),
++                ],
++            )
++        };
++        let down = point(1, CGEventType::LeftMouseDown);
++        let Some(PlatformInput::MouseDown(e)) =
++            (unsafe { platform_input_from_native(down, window_height, &mut tablet) })
++        else {
++            panic!("a mouse down");
++        };
++        let pen = e.pen.expect("a pen");
++        // the event stores pressure in 1/255 steps
++        assert!((pen.pressure - 0.625).abs() < 0.01);
++        // tilt is in degrees, y positive towards the user (AppKit's y is up)
++        assert!((pen.tilt.x - 45.0).abs() < 0.01 && (pen.tilt.y - 22.5).abs() < 0.01);
++        assert!(!pen.eraser);
++
++        let drag = point(1, CGEventType::LeftMouseDragged);
++        let Some(PlatformInput::MouseMove(e)) =
++            (unsafe { platform_input_from_native(drag, window_height, &mut tablet) })
++        else {
++            panic!("a mouse move");
++        };
++        assert!(e.pen.is_some_and(|p| (p.pressure - 0.625).abs() < 0.01));
++
++        // the eraser end comes into proximity: later points are the eraser's
++        let proximity = tablet_event(
++            CGEventType::MouseMoved,
++            2,
++            &[
++                (EventField::TABLET_PROXIMITY_EVENT_POINTER_TYPE, 3.0),
++                (EventField::TABLET_PROXIMITY_EVENT_ENTER_PROXIMITY, 1.0),
++            ],
++        );
++        let Some(PlatformInput::MouseMove(e)) =
++            (unsafe { platform_input_from_native(proximity, window_height, &mut tablet) })
++        else {
++            panic!("a mouse move");
++        };
++        assert_eq!(e.pen.map(|p| (p.pressure, p.eraser)), Some((0.0, true)));
++        let up = point(1, CGEventType::LeftMouseUp);
++        let Some(PlatformInput::MouseUp(e)) =
++            (unsafe { platform_input_from_native(up, window_height, &mut tablet) })
++        else {
++            panic!("a mouse up");
++        };
++        assert!(e.pen.is_some_and(|p| p.eraser));
++
++        // the pen leaves the tablet: it points nowhere
++        let away = tablet_event(
++            CGEventType::MouseMoved,
++            2,
++            &[
++                (EventField::TABLET_PROXIMITY_EVENT_POINTER_TYPE, 3.0),
++                (EventField::TABLET_PROXIMITY_EVENT_ENTER_PROXIMITY, 0.0),
++            ],
++        );
++        assert!(matches!(
++            unsafe { platform_input_from_native(away, window_height, &mut tablet) },
++            Some(PlatformInput::MouseExited(_))
++        ));
++
++        // a mouse (subtype 0) has no pen, whatever its pressure
++        let mouse = tablet_event(CGEventType::LeftMouseDown, 0, &[]);
++        let Some(PlatformInput::MouseDown(e)) =
++            (unsafe { platform_input_from_native(mouse, window_height, &mut tablet) })
++        else {
++            panic!("a mouse down");
++        };
++        assert_eq!(e.pen, None);
++    }
+ }
+diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+index 6a3e11e..6864e4a 100644
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -1,6 +1,7 @@
+ use crate::{
+     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
+-    TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
++    TISGetInputSourceProperty, WindowFrameSource,
++    events::{TabletState, platform_input_from_native},
+     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
+     ns_string, renderer,
+ };
+@@ -176,6 +177,10 @@ unsafe fn build_classes() {
+                 sel!(resetCursorRects),
+                 reset_cursor_rects as extern "C" fn(&Object, Sel),
+             );
++            decl.add_method(
++                sel!(tabletProximity:),
++                handle_view_event as extern "C" fn(&Object, Sel, id),
++            );
+             decl.add_method(
+                 sel!(pressureChangeWithEvent:),
+                 handle_view_event as extern "C" fn(&Object, Sel, id),
+@@ -692,6 +697,8 @@ struct MacWindowState {
+     external_files_dragged: bool,
+     // Whether the next left-mouse click is also the focusing click.
+     first_mouse: bool,
++    /// Which end of a tablet's pen is in proximity (see [`TabletState`]).
++    tablet: TabletState,
+     // When true, the whole content view is reported as app-owned titlebar content via
+     // `_opaqueRectForWindowMoveWhenInTitlebar`, so AppKit does not drag the window from
+     // the titlebar or delay titlebar clicks (a delay first observed on macOS 27). Such
+@@ -1132,6 +1139,7 @@ impl MacWindow {
+                 do_command_handled: None,
+                 external_files_dragged: false,
+                 first_mouse: false,
++                tablet: TabletState::default(),
+                 app_owns_titlebar_drag,
+                 fullscreen_restore_bounds: Bounds::default(),
+                 is_exiting_fullscreen: false,
+@@ -2738,7 +2746,9 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent:
+     let mut lock = window_state.as_ref().lock();
+ 
+     let window_height = lock.content_size().height;
+-    let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
++    let event = unsafe {
++        platform_input_from_native(native_event, Some(window_height), &mut lock.tablet)
++    };
+ 
+     let Some(event) = event else {
+         return NO;
+@@ -2892,7 +2902,9 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
+         }
+         _ => {}
+     }
+-    let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
++    let event = unsafe {
++        platform_input_from_native(native_event, Some(window_height), &mut lock.tablet)
++    };
+ 
+     if let Some(mut event) = event {
+         // AppKit unhides the cursor on the next mouse movement; mirror that here.
+@@ -2910,10 +2922,14 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
+         }
+ 
+         match &mut event {
++            // (Pens keep their button: a tablet reports the tip or eraser
++            // pressed with ⌃, as web engines do, and has its own right
++            // button.)
+             PlatformInput::MouseDown(
+                 event @ MouseDownEvent {
+                     button: MouseButton::Left,
+                     modifiers: Modifiers { control: true, .. },
++                    pen: None,
+                     ..
+                 },
+             ) => {
+@@ -2950,6 +2966,7 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
+                 event @ MouseUpEvent {
+                     button: MouseButton::Left,
+                     modifiers: Modifiers { control: true, .. },
++                    pen: None,
+                     ..
+                 },
+             ) => {
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index bc854cc..75c347e 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -302,6 +302,7 @@ impl WebWindowInner {
+                 modifiers,
+                 click_count,
+                 first_mouse: false,
++                pen: None,
+             }));
+ 
+             this.ime_mirror.focus();
+@@ -386,6 +387,7 @@ impl WebWindowInner {
+                 position,
+                 modifiers,
+                 click_count,
++                pen: None,
+             }));
+ 
+             this.schedule_ime_mirror_sync();
+@@ -606,6 +608,7 @@ impl WebWindowInner {
+                 position,
+                 pressed_button: current_pressed,
+                 modifiers,
++                pen: None,
+             }));
+         })
+     }
+diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
+index f1910b5..03716ac 100644
+--- a/crates/gpui_windows/src/events.rs
++++ b/crates/gpui_windows/src/events.rs
+@@ -392,6 +392,7 @@ impl WindowsWindowInner {
+             position: logical_point(x, y, scale_factor),
+             pressed_button,
+             modifiers: current_modifiers(),
++            pen: None,
+         });
+         let handled = !func(input).propagate;
+         self.state.callbacks.input.set(Some(func));
+@@ -506,6 +507,7 @@ impl WindowsWindowInner {
+             modifiers: current_modifiers(),
+             click_count,
+             first_mouse: false,
++            pen: None,
+         });
+         let handled = !func(input).propagate;
+         self.state.callbacks.input.set(Some(func));
+@@ -534,6 +536,7 @@ impl WindowsWindowInner {
+             position: logical_point(x, y, scale_factor),
+             modifiers: current_modifiers(),
+             click_count,
++            pen: None,
+         });
+         let handled = !func(input).propagate;
+         self.state.callbacks.input.set(Some(func));
+@@ -1044,6 +1047,7 @@ impl WindowsWindowInner {
+             position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
+             pressed_button: None,
+             modifiers: current_modifiers(),
++            pen: None,
+         });
+         let handled = !func(input).propagate;
+         self.state.callbacks.input.set(Some(func));
+@@ -1074,6 +1078,7 @@ impl WindowsWindowInner {
+                 modifiers: current_modifiers(),
+                 click_count,
+                 first_mouse: false,
++                pen: None,
+             });
+             let handled = !func(input).propagate;
+             self.state.callbacks.input.set(Some(func));
+@@ -1118,6 +1123,7 @@ impl WindowsWindowInner {
+                 position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
+                 modifiers: current_modifiers(),
+                 click_count: 1,
++                pen: None,
+             });
+             let handled = !func(input).propagate;
+             self.state.callbacks.input.set(Some(func));

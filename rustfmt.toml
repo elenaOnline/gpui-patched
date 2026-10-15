@@ -1,0 +1,2 @@
+# `cargo fmt --all` reaches path dependencies: leave zed's code as it is.
+disable_all_formatting = true

@@ -1,0 +1,339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "GPT-6 Sol (Codex)" <noreply@openai.com>
+Date: Fri, 2 Oct 2026 18:06:49 -0700
+Subject: [PATCH] gpui: Add multiply compositing for retained meshes
+
+Co-Authored-By: GPT-6 Sol (Codex) <noreply@openai.com>
+---
+ crates/gpui/src/mesh.rs                 | 11 ++++++
+ crates/gpui/src/scene.rs                | 30 ++++++++++------
+ crates/gpui/src/window.rs               | 35 +++++++++++++++++--
+ crates/gpui_apple/src/metal_renderer.rs | 46 ++++++++++++++++++++-----
+ 4 files changed, 101 insertions(+), 21 deletions(-)
+
+diff --git a/crates/gpui/src/mesh.rs b/crates/gpui/src/mesh.rs
+index 355b108..6c0a492 100644
+--- a/crates/gpui/src/mesh.rs
++++ b/crates/gpui/src/mesh.rs
+@@ -21,6 +21,16 @@ use crate::{Bounds, Point, Rgba, TransformationMatrix, point, size};
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+ pub struct MeshId(pub u64);
+ 
++/// How a mesh draw composites with the destination after rasterization.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum MeshBlendMode {
++    #[default]
++    /// Ordinary source-over compositing.
++    Normal,
++    /// Premultiplied source times destination, plus destination where source is absent.
++    Multiply,
++}
++
+ /// A vertex of a [`Mesh`], as renderers store it: a position in the mesh's own space and a
+ /// straight (not premultiplied) colour with 16 bits per channel, red and green in the low and
+ /// high halves of `rg`, blue and alpha in `ba`.
+@@ -484,6 +494,7 @@ mod tests {
+             [point(0., 0.), point(10., 0.), point(0., 10.)].map(|p| MeshVertex::new(p, orange)),
+         );
+         let draw = MeshDraw {
++            blend_mode: crate::MeshBlendMode::Normal,
+             order: 0,
+             bounds: Bounds::default(),
+             content_mask: ContentMask::default(),
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index 138457c..8e98030 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
+ 
+ use crate::{
+     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Mesh,
+-    MeshGradient, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
++    MeshBlendMode, MeshGradient, Pixels, Point, Radians, ScaledPixels, Size,
++    bounds_tree::BoundsTree, point,
+ };
+ use std::{
+     fmt::Debug,
+@@ -414,10 +415,14 @@ impl<'a> Iterator for BatchIterator<'a> {
+             PrimitiveKind::Mesh => {
+                 let meshes_start = self.meshes_start;
+                 let mut meshes_end = meshes_start + 1;
++                let blend_mode = self.meshes_iter.peek().unwrap().blend_mode;
+                 self.meshes_iter.next();
+                 while self
+                     .meshes_iter
+-                    .next_if(|mesh| (mesh.order, batch_kind) < max_order_and_kind)
++                    .next_if(|mesh| {
++                        mesh.blend_mode == blend_mode
++                            && (mesh.order, batch_kind) < max_order_and_kind
++                    })
+                     .is_some()
+                 {
+                     meshes_end += 1;
+@@ -552,22 +557,25 @@ pub enum PrimitiveBatch {
+     Surfaces(Range<usize>),
+ }
+ 
+-/// Where the mesh run that starts with the meshes at `batches[start]` ends: after the last
+-/// batch of meshes reachable from it through sprites and shadows. A renderer rasterizes a run
+-/// in one pass through its multisampled path texture, the sprites and shadows painted between
+-/// its meshes (a canvas's text, its cards' drop shadows) in order with them.
+-pub fn mesh_run_end(batches: &[PrimitiveBatch], start: usize) -> usize {
++/// Where the mesh run that starts with the meshes at `batches[start]` ends. Normal meshes
++/// absorb intervening sprites and shadows into one pass. Other blend modes stop before the
++/// first non-mesh batch, so those primitives keep their normal source-over composition.
++pub fn mesh_run_end(scene: &Scene, batches: &[PrimitiveBatch], start: usize) -> usize {
++    let PrimitiveBatch::Meshes(first) = &batches[start] else {
++        return start + 1;
++    };
++    let blend_mode = scene.meshes[first.start].blend_mode;
+     let mut end = start + 1;
+     let mut next = start + 1;
+     while let Some(batch) = batches.get(next) {
+         match batch {
+-            PrimitiveBatch::Meshes(_) => {
++            PrimitiveBatch::Meshes(range) if scene.meshes[range.start].blend_mode == blend_mode => {
+                 next += 1;
+                 end = next;
+             }
+             PrimitiveBatch::MonochromeSprites { .. }
+             | PrimitiveBatch::PolychromeSprites { .. }
+-            | PrimitiveBatch::Shadows(_) => next += 1,
++            | PrimitiveBatch::Shadows(_) if blend_mode == MeshBlendMode::Normal => next += 1,
+             _ => break,
+         }
+     }
+@@ -584,7 +592,7 @@ impl Scene {
+         while next < batches.len() {
+             if matches!(batches[next], PrimitiveBatch::Meshes(_)) {
+                 passes += 1;
+-                next = mesh_run_end(&batches, next);
++                next = mesh_run_end(self, &batches, next);
+             } else {
+                 next += 1;
+             }
+@@ -939,6 +947,8 @@ pub struct PathId(pub usize);
+ /// A [`Mesh`] painted with a transformation and paint (see [`crate::Window::paint_mesh`]).
+ #[derive(Clone, Debug)]
+ pub struct MeshDraw {
++    /// Composite operation for this mesh.
++    pub blend_mode: crate::MeshBlendMode,
+     /// The draw order, assigned when the draw is inserted into a scene.
+     pub order: DrawOrder,
+     /// The area the draw may paint: the transformed mesh bounds, rounded out to whole device
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 1d9f4ce..337155c 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -11,7 +11,7 @@ use crate::{
+     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+     EntityId, EventEmitter, FileDropEvent, FontId, FontSmoothing, Global, GlobalElementId, GlyphId,
+     GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Mesh, MeshDraw, MeshGradient, Modifiers,
++    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Mesh, MeshBlendMode, MeshDraw, MeshGradient, Modifiers,
+     ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+     Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+     PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+@@ -4782,7 +4782,19 @@ impl Window {
+         paint: impl Into<Background>,
+     ) {
+         self.invalidator.debug_assert_paint();
+-        self.insert_mesh(mesh, transformation, paint.into(), None);
++        self.insert_mesh(mesh, transformation, paint.into(), None, MeshBlendMode::Normal);
++    }
++
++    /// Paint a mesh with an explicit destination blend mode.
++    pub fn paint_mesh_blend(
++        &mut self,
++        mesh: &Mesh,
++        transformation: TransformationMatrix,
++        paint: impl Into<Background>,
++        blend_mode: MeshBlendMode,
++    ) {
++        self.invalidator.debug_assert_paint();
++        self.insert_mesh(mesh, transformation, paint.into(), None, blend_mode);
+     }
+ 
+     /// Paint a [`Mesh`] with a [`MeshGradient`] into the scene for the next frame at the
+@@ -4808,7 +4820,22 @@ impl Window {
+         if gradient.stops.is_empty() {
+             return;
+         }
+-        self.insert_mesh(mesh, transformation, paint.into(), Some(gradient));
++        self.insert_mesh(mesh, transformation, paint.into(), Some(gradient), MeshBlendMode::Normal);
++    }
++
++    /// Paint a gradient mesh with an explicit destination blend mode.
++    pub fn paint_mesh_gradient_blend(
++        &mut self,
++        mesh: &Mesh,
++        transformation: TransformationMatrix,
++        gradient: Arc<MeshGradient>,
++        paint: impl Into<Background>,
++        blend_mode: MeshBlendMode,
++    ) {
++        self.invalidator.debug_assert_paint();
++        if !gradient.stops.is_empty() {
++            self.insert_mesh(mesh, transformation, paint.into(), Some(gradient), blend_mode);
++        }
+     }
+ 
+     fn insert_mesh(
+@@ -4817,6 +4844,7 @@ impl Window {
+         transformation: TransformationMatrix,
+         paint: Background,
+         gradient: Option<Arc<MeshGradient>>,
++        blend_mode: MeshBlendMode,
+     ) {
+         if mesh.is_empty() {
+             return;
+@@ -4855,6 +4883,7 @@ impl Window {
+         let opacity = self.element_opacity();
+         let content_mask = self.content_mask().scale(scale_factor);
+         self.next_frame.scene.insert_primitive(MeshDraw {
++            blend_mode,
+             order: 0,
+             bounds,
+             content_mask,
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index cfc948a..ea69ae3 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -8,7 +8,7 @@ use cocoa::{
+     quartzcore::AutoresizingMask,
+ };
+ use gpui::{
+-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MeshDraw, MeshGradient,
++    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MeshBlendMode, MeshDraw, MeshGradient,
+     MeshGradientShape, MeshGradientSpread, PaintSurface, Path, Point, PrimitiveBatch,
+     ScaledPixels, Scene, Shadow, Size, TransformationMatrix, point, size,
+ };
+@@ -132,6 +132,7 @@ pub struct MetalRenderer {
+     paths_rasterization_pipeline_state: metal::RenderPipelineState,
+     meshes_rasterization_pipeline_state: metal::RenderPipelineState,
+     path_sprites_pipeline_state: metal::RenderPipelineState,
++    multiply_path_sprites_pipeline_state: metal::RenderPipelineState,
+     shadows_pipeline_state: metal::RenderPipelineState,
+     quads_pipeline_state: metal::RenderPipelineState,
+     underlines_pipeline_state: metal::RenderPipelineState,
+@@ -354,6 +355,10 @@ impl MetalRenderer {
+             "path_sprite_fragment",
+             MTLPixelFormat::BGRA8Unorm,
+         );
++        let multiply_path_sprites_pipeline_state = build_path_sprite_pipeline_state_with_blend(
++            &device, &library, "multiply_path_sprites", "path_sprite_vertex",
++            "path_sprite_fragment", MTLPixelFormat::BGRA8Unorm, MeshBlendMode::Multiply,
++        );
+         let shadows_pipeline_state = build_pipeline_state(
+             &device,
+             &library,
+@@ -448,6 +453,7 @@ impl MetalRenderer {
+             paths_rasterization_pipeline_state,
+             meshes_rasterization_pipeline_state,
+             path_sprites_pipeline_state,
++            multiply_path_sprites_pipeline_state,
+             shadows_pipeline_state,
+             quads_pipeline_state,
+             underlines_pipeline_state,
+@@ -844,12 +850,10 @@ impl MetalRenderer {
+                     }
+                 }
+                 PrimitiveBatch::Meshes(_) => {
+-                    // Sprites and shadows painted between meshes (a canvas's text, its cards'
+-                    // drop shadows) are rasterized with them, in order, so that interleaved
+-                    // meshes, text and shadows cost one pass (each pass clears, resolves and
+-                    // composites the full-window multisampled texture).
++                    // Normal meshes absorb intervening sprites and shadows to save passes.
++                    // Other blend modes stop before them, preserving their source-over paint.
+                     let start = next - 1;
+-                    let end = gpui::mesh_run_end(&batches, start);
++                    let end = gpui::mesh_run_end(scene, &batches, start);
+                     next = end;
+                     command_encoder.end_encoding();
+ 
+@@ -872,6 +876,7 @@ impl MetalRenderer {
+                     if let Some(bounds) = drawn_bounds
+                         && let Err(error) = self.composite_intermediate(
+                             &[PathSprite { bounds }],
++                            scene.meshes[match &batches[start] { PrimitiveBatch::Meshes(range) => range.start, _ => unreachable!() }].blend_mode,
+                             writer,
+                             viewport_size,
+                             command_encoder,
+@@ -1416,6 +1421,7 @@ impl MetalRenderer {
+     fn composite_intermediate(
+         &self,
+         sprites: &[PathSprite],
++        blend_mode: MeshBlendMode,
+         writer: &mut InstanceBufferWriter,
+         viewport_size: Size<DevicePixels>,
+         command_encoder: &metal::RenderCommandEncoderRef,
+@@ -1425,7 +1431,10 @@ impl MetalRenderer {
+             .as_ref()
+             .context("missing path intermediate texture")?;
+ 
+-        command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
++        command_encoder.set_render_pipeline_state(match blend_mode {
++            MeshBlendMode::Normal => &self.path_sprites_pipeline_state,
++            MeshBlendMode::Multiply => &self.multiply_path_sprites_pipeline_state,
++        });
+         command_encoder.set_vertex_buffer(
+             SpriteInputIndex::Vertices as u64,
+             Some(&self.unit_vertices),
+@@ -1854,6 +1863,21 @@ fn build_path_sprite_pipeline_state(
+     vertex_fn_name: &str,
+     fragment_fn_name: &str,
+     pixel_format: metal::MTLPixelFormat,
++) -> metal::RenderPipelineState {
++    build_path_sprite_pipeline_state_with_blend(
++        device, library, label, vertex_fn_name, fragment_fn_name, pixel_format,
++        MeshBlendMode::Normal,
++    )
++}
++
++fn build_path_sprite_pipeline_state_with_blend(
++    device: &metal::DeviceRef,
++    library: &metal::LibraryRef,
++    label: &str,
++    vertex_fn_name: &str,
++    fragment_fn_name: &str,
++    pixel_format: metal::MTLPixelFormat,
++    blend_mode: MeshBlendMode,
+ ) -> metal::RenderPipelineState {
+     let vertex_fn = library
+         .get_function(vertex_fn_name, None)
+@@ -1871,7 +1895,10 @@ fn build_path_sprite_pipeline_state(
+     color_attachment.set_blending_enabled(true);
+     color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+     color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+-    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
++    color_attachment.set_source_rgb_blend_factor(match blend_mode {
++        MeshBlendMode::Normal => metal::MTLBlendFactor::One,
++        MeshBlendMode::Multiply => metal::MTLBlendFactor::DestinationColor,
++    });
+     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+@@ -2383,6 +2410,7 @@ mod mesh_tests {
+             })
+             .dilate(ScaledPixels(1.));
+         scene.insert_primitive(MeshDraw {
++            blend_mode: gpui::MeshBlendMode::Normal,
+             order: 0,
+             bounds,
+             content_mask: whole_viewport(),
+@@ -2499,6 +2527,7 @@ mod mesh_tests {
+             translation: [x, y],
+         };
+         let draw = |mesh: &Mesh, transformation: TransformationMatrix, clip: f32| MeshDraw {
++            blend_mode: gpui::MeshBlendMode::Normal,
+             order: 0,
+             bounds: transformation.transform_bounds(Bounds {
+                 origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+@@ -2621,6 +2650,7 @@ mod mesh_tests {
+             let mut scene = Scene::default();
+             let b = square.bounds();
+             scene.insert_primitive(MeshDraw {
++            blend_mode: gpui::MeshBlendMode::Normal,
+                 order: 0,
+                 bounds: t
+                     .transform_bounds(Bounds {

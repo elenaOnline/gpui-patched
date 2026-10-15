@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 21:02:18 -0700
+Subject: [PATCH] gpui: Draw the shadows between a run's meshes inside the run
+ (Metal)
+
+The Metal renderer rasterizes a run of mesh batches, and the sprites painted
+between them, in one pass through the multisampled path texture. A shadow
+batch ended the run, so a canvas whose cards cast drop shadows (sticky notes)
+drew every visible card in a pass of its own: a render encoder for the
+full-window 4x MSAA texture, a clear and resolve, a composite and the main
+pass reopened. With 400 notes on screen, encoding a frame took ~40 ms.
+
+Shadows painted between a run's meshes are now drawn inside the run, in
+order, with a shadow pipeline for the multisampled path texture (the sprite
+blending that stores premultiplied colour), and the run's composite covers
+their painted area (shadow_bounds). mesh_run_end (gpui::scene) is the one
+definition of a run; Scene::mesh_passes and the test-support
+Window::mesh_passes count the passes a frame's meshes take.
+
+The headless benchmark path (render_scene) also stops making new path
+textures for every frame it renders: only for a new size, as a window does
+on resize.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/scene.rs                | 41 ++++++++++++
+ crates/gpui/src/window.rs               |  7 ++
+ crates/gpui_apple/src/metal_renderer.rs | 89 ++++++++++++++++++++-----
+ 3 files changed, 120 insertions(+), 17 deletions(-)
+
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index 44ae842..fc99645 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -551,6 +551,47 @@ pub enum PrimitiveBatch {
+     Surfaces(Range<usize>),
+ }
+ 
++/// Where the mesh run that starts with the meshes at `batches[start]` ends: after the last
++/// batch of meshes reachable from it through sprites and shadows. A renderer rasterizes a run
++/// in one pass through its multisampled path texture, the sprites and shadows painted between
++/// its meshes (a canvas's text, its cards' drop shadows) in order with them.
++pub fn mesh_run_end(batches: &[PrimitiveBatch], start: usize) -> usize {
++    let mut end = start + 1;
++    let mut next = start + 1;
++    while let Some(batch) = batches.get(next) {
++        match batch {
++            PrimitiveBatch::Meshes(_) => {
++                next += 1;
++                end = next;
++            }
++            PrimitiveBatch::MonochromeSprites { .. }
++            | PrimitiveBatch::PolychromeSprites { .. }
++            | PrimitiveBatch::Shadows(_) => next += 1,
++            _ => break,
++        }
++    }
++    end
++}
++
++impl Scene {
++    /// How many mesh runs ([`mesh_run_end`]) the scene's batches make: the passes the Metal
++    /// renderer draws its meshes in.
++    pub fn mesh_passes(&self) -> usize {
++        let batches: Vec<PrimitiveBatch> = self.batches().collect();
++        let mut passes = 0;
++        let mut next = 0;
++        while next < batches.len() {
++            if matches!(batches[next], PrimitiveBatch::Meshes(_)) {
++                passes += 1;
++                next = mesh_run_end(&batches, next);
++            } else {
++                next += 1;
++            }
++        }
++        passes
++    }
++}
++
+ impl PrimitiveBatch {
+     #[expect(missing_docs)]
+     pub fn label(&self) -> String {
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index ec23570..0700998 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -2724,6 +2724,13 @@ impl Window {
+         self.platform_window.draw(&self.rendered_frame.scene);
+     }
+ 
++    /// How many passes the most recently rendered frame's meshes are drawn in
++    /// ([`Scene::mesh_passes`]), so tests can check what breaks a mesh run.
++    #[cfg(any(test, feature = "test-support"))]
++    pub fn mesh_passes(&self) -> usize {
++        self.rendered_frame.scene.mesh_passes()
++    }
++
+     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
+     /// painted output without rasterizing the frame. Quad bounds are in scaled pixels and are
+     /// not clipped; each quad carries the content mask it will be clipped to when drawn. Quads
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index 74554f1..20e9504 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -9,7 +9,7 @@ use cocoa::{
+ };
+ use gpui::{
+     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MeshDraw, PaintSurface, Path,
+-    Point, PrimitiveBatch, ScaledPixels, Scene, Size, TransformationMatrix, point, size,
++    Point, PrimitiveBatch, ScaledPixels, Scene, Shadow, Size, TransformationMatrix, point, size,
+ };
+ #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+ use image::RgbaImage;
+@@ -139,6 +139,7 @@ pub struct MetalRenderer {
+     /// Sprites rasterized into the path texture with the meshes around them.
+     intermediate_monochrome_sprites_pipeline_state: metal::RenderPipelineState,
+     intermediate_polychrome_sprites_pipeline_state: metal::RenderPipelineState,
++    intermediate_shadows_pipeline_state: metal::RenderPipelineState,
+     surfaces_pipeline_state: metal::RenderPipelineState,
+     unit_vertices: metal::Buffer,
+     #[allow(clippy::arc_with_non_send_sync)]
+@@ -380,6 +381,16 @@ impl MetalRenderer {
+                 "polychrome_sprite_fragment",
+                 PATH_SAMPLE_COUNT,
+             );
++        // (shadows painted between meshes are drawn with them: see
++        // `draw_mesh_run_to_intermediate`)
++        let intermediate_shadows_pipeline_state = build_intermediate_sprite_pipeline_state(
++            &device,
++            &library,
++            "intermediate_shadows",
++            "shadow_vertex",
++            "shadow_fragment",
++            PATH_SAMPLE_COUNT,
++        );
+         let surfaces_pipeline_state = build_pipeline_state(
+             &device,
+             &library,
+@@ -413,6 +424,7 @@ impl MetalRenderer {
+             polychrome_sprites_pipeline_state,
+             intermediate_monochrome_sprites_pipeline_state,
+             intermediate_polychrome_sprites_pipeline_state,
++            intermediate_shadows_pipeline_state,
+             surfaces_pipeline_state,
+             unit_vertices,
+             instance_buffer_pool,
+@@ -703,7 +715,14 @@ impl MetalRenderer {
+         }
+ 
+         objc2::rc::autoreleasepool(|_| {
+-            self.update_path_intermediate_textures(size);
++            // (made again only for a new size, as a window's are on resize: a benchmark's frames
++            // must not allocate two full-window textures each)
++            let intermediates_fit = self.path_intermediate_texture.as_ref().is_some_and(|texture| {
++                texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
++            });
++            if !intermediates_fit {
++                self.update_path_intermediate_textures(size);
++            }
+ 
+             let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
+                 texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
+@@ -794,21 +813,12 @@ impl MetalRenderer {
+                     }
+                 }
+                 PrimitiveBatch::Meshes(_) => {
+-                    // Sprites painted between meshes (a canvas's text) are rasterized with them,
+-                    // in order, so that interleaved meshes and text cost one pass.
++                    // Sprites and shadows painted between meshes (a canvas's text, its cards'
++                    // drop shadows) are rasterized with them, in order, so that interleaved
++                    // meshes, text and shadows cost one pass (each pass clears, resolves and
++                    // composites the full-window multisampled texture).
+                     let start = next - 1;
+-                    let mut end = next;
+-                    while let Some(batch) = batches.get(next) {
+-                        match batch {
+-                            PrimitiveBatch::Meshes(_) => {
+-                                next += 1;
+-                                end = next;
+-                            }
+-                            PrimitiveBatch::MonochromeSprites { .. }
+-                            | PrimitiveBatch::PolychromeSprites { .. } => next += 1,
+-                            _ => break,
+-                        }
+-                    }
++                    let end = gpui::mesh_run_end(&batches, start);
+                     next = end;
+                     command_encoder.end_encoding();
+ 
+@@ -951,12 +961,31 @@ impl MetalRenderer {
+         instance_bindings: &InstanceBindings,
+         viewport_size: Size<DevicePixels>,
+         command_encoder: &metal::RenderCommandEncoderRef,
++    ) {
++        self.draw_shadows_with(
++            &self.shadows_pipeline_state,
++            shadows,
++            instance_bindings,
++            viewport_size,
++            command_encoder,
++        );
++    }
++
++    /// Draws a range of shadows with `pipeline_state` (the target's, or the multisampled path
++    /// texture's for shadows inside a mesh run).
++    fn draw_shadows_with(
++        &self,
++        pipeline_state: &metal::RenderPipelineState,
++        shadows: Range<usize>,
++        instance_bindings: &InstanceBindings,
++        viewport_size: Size<DevicePixels>,
++        command_encoder: &metal::RenderCommandEncoderRef,
+     ) {
+         if shadows.is_empty() {
+             return;
+         }
+ 
+-        command_encoder.set_render_pipeline_state(&self.shadows_pipeline_state);
++        command_encoder.set_render_pipeline_state(pipeline_state);
+         command_encoder.set_vertex_buffer(
+             ShadowInputIndex::Vertices as u64,
+             Some(&self.unit_vertices),
+@@ -1202,6 +1231,18 @@ impl MetalRenderer {
+                             command_encoder,
+                         );
+                     }
++                    PrimitiveBatch::Shadows(range) => {
++                        for shadow in &scene.shadows[range.clone()] {
++                            add(shadow_bounds(shadow));
++                        }
++                        self.draw_shadows_with(
++                            &self.intermediate_shadows_pipeline_state,
++                            range.clone(),
++                            instance_bindings,
++                            viewport_size,
++                            command_encoder,
++                        );
++                    }
+                     _ => {}
+                 }
+             }
+@@ -1716,6 +1757,20 @@ fn build_intermediate_sprite_pipeline_state(
+         .expect("could not create render pipeline state")
+ }
+ 
++/// The area a shadow paints: its quad (the element for an inset shadow, else the shadow rect
++/// with the gaussian's tail), transformed, within its clip.
++fn shadow_bounds(shadow: &Shadow) -> Bounds<ScaledPixels> {
++    let painted = if shadow.transformation == TransformationMatrix::unit() {
++        shadow.painted_geometry()
++    } else {
++        shadow
++            .transformation
++            .transform_bounds(shadow.painted_geometry())
++            .dilate(ScaledPixels(1.))
++    };
++    painted.intersect(&shadow.content_mask.bounds)
++}
++
+ /// The area a sprite paints (its transformed bounds within its clip).
+ fn sprite_bounds(
+     bounds: Bounds<ScaledPixels>,

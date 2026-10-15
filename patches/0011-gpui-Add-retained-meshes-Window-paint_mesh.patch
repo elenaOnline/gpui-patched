@@ -1,0 +1,2776 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 06:43:53 -0700
+Subject: [PATCH] gpui: Add retained meshes (Window::paint_mesh)
+
+A Path is rebuilt and written into the frame's instance buffer every frame
+it is painted, so a canvas of many shapes costs its vertices every frame:
+about 10 ns per vertex on the CPU and ~100 bytes of instance data per
+vertex, which at a million vertices is 20-100 ms a frame.
+
+A Mesh is an immutable triangle list with a colour per vertex (16 bits per
+channel). Window::paint_mesh(mesh, transformation, paint) paints it with a
+transformation to window pixels and a paint (any Background) its vertex
+colours are multiplied by: white draws the vertex colours, translucent
+white fades them, a pattern or gradient is drawn in them. The Metal
+renderer uploads a mesh the first time it is painted and keeps it on the
+GPU while it is in use, so painting it again costs a small record whatever
+its size:
+
+* MeshStore keeps mesh vertices in a few shared buffers ("pages", added as
+  needed, never copied), in blocks of 48 vertices allocated from a free list.
+  A mesh is dropped from the GPU once every Mesh handle is gone (weak
+  handles, swept every 32 frames) or, beyond a 256 MB budget, when it was
+  painted least recently. Blocks are reused only after the frames that drew
+  them completed on the GPU (command buffer completion handlers).
+* A batch of meshes is one instanced draw call: an instance per block
+  (MeshChunk), 48 vertices each, transformed and clipped in the vertex
+  shader; vertices past a draw's last block collapse. The CPU writes one
+  record per draw and 12 bytes per block.
+* Meshes are rasterized like paths, into the multisampled path texture
+  (the same pipeline setup, sample count and blending), then composited
+  once over the union of their bounds, so they are anti-aliased exactly
+  like paths. Draws keep their paint order within a batch, and sprites
+  painted between meshes (a canvas's text) are rasterized into the same
+  pass in order, so interleaved meshes and text cost one pass instead of
+  one per switch.
+
+The wgpu and DirectX renderers rasterize meshes through their path pipeline
+(MeshDraw::path_vertices transforms the vertices on the CPU every frame),
+which is correct but costs what paths cost. Retained-buffer entry points
+for them are included: WGSL (vs_mesh/fs_mesh in the storage-buffer
+transport, validated by the naga tests) and HLSL (mesh_vertex/
+mesh_fragment, not compiled here), not wired to pipelines yet.
+
+Window::render_offscreen (test-support) renders the last drawn frame the
+way presenting it does, for benchmarks of windows that are not on screen.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/gpui.rs                     |   2 +
+ crates/gpui/src/mesh.rs                     | 293 +++++++
+ crates/gpui/src/scene.rs                    | 104 ++-
+ crates/gpui/src/window.rs                   | 100 ++-
+ crates/gpui_apple/Cargo.toml                |   1 +
+ crates/gpui_apple/build.rs                  |   5 +
+ crates/gpui_apple/src/gpui_apple.rs         |   1 +
+ crates/gpui_apple/src/metal_meshes.rs       | 387 +++++++++
+ crates/gpui_apple/src/metal_renderer.rs     | 832 ++++++++++++++++++--
+ crates/gpui_apple/src/shaders.metal         | 109 +++
+ crates/gpui_wgpu/src/shaders_storage.wgsl   |  91 +++
+ crates/gpui_wgpu/src/wgpu_renderer.rs       |  83 +-
+ crates/gpui_windows/src/directx_renderer.rs |  84 +-
+ crates/gpui_windows/src/shaders.hlsl        |  92 +++
+ 14 files changed, 2090 insertions(+), 94 deletions(-)
+ create mode 100644 crates/gpui/src/mesh.rs
+ create mode 100644 crates/gpui_apple/src/metal_meshes.rs
+
+diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
+index 51585b5..7b1c538 100644
+--- a/crates/gpui/src/gpui.rs
++++ b/crates/gpui/src/gpui.rs
+@@ -31,6 +31,7 @@ mod inspector;
+ mod interactive;
+ mod key_dispatch;
+ mod keymap;
++mod mesh;
+ mod path_builder;
+ mod platform;
+ pub mod prelude;
+@@ -141,6 +142,7 @@ pub use inspector::*;
+ pub use interactive::*;
+ use key_dispatch::*;
+ pub use keymap::*;
++pub use mesh::*;
+ pub use path_builder::*;
+ pub use platform::*;
+ pub use profiler::*;
+diff --git a/crates/gpui/src/mesh.rs b/crates/gpui/src/mesh.rs
+new file mode 100644
+index 0000000..615f142
+--- /dev/null
++++ b/crates/gpui/src/mesh.rs
+@@ -0,0 +1,293 @@
++//! Retained triangle meshes: geometry that is uploaded to the GPU once and then drawn in any
++//! number of frames with a transformation and a paint (see [`crate::Window::paint_mesh`]).
++//!
++//! A [`Path`](crate::Path) is rebuilt and uploaded every frame it is painted, so its cost is
++//! proportional to its vertices, every frame. A [`Mesh`] is uploaded the first time it is
++//! painted and stays on the GPU while it is in use; painting it again only records its
++//! transformation, paint and clip, whatever its size. That makes it the primitive for scenes of
++//! many shapes that move, pan and zoom as a whole: canvases, diagrams, maps.
++//!
++//! Meshes are rasterized like paths (into the multisampled path texture, then composited), so
++//! both are anti-aliased the same way.
++
++use std::sync::{
++    Arc, Weak,
++    atomic::{AtomicU64, Ordering},
++};
++
++use crate::{Bounds, Point, Rgba, point, size};
++
++/// Identifies a [`Mesh`]'s geometry, which renderers keep on the GPU while the mesh is in use.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
++pub struct MeshId(pub u64);
++
++/// A vertex of a [`Mesh`], as renderers store it: a position in the mesh's own space and a
++/// straight (not premultiplied) colour with 16 bits per channel, red and green in the low and
++/// high halves of `rg`, blue and alpha in `ba`.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++#[repr(C)]
++pub struct MeshVertex {
++    /// The position (x, y).
++    pub position: [f32; 2],
++    /// Red (low 16 bits) and green (high 16 bits).
++    pub rg: u32,
++    /// Blue (low 16 bits) and alpha (high 16 bits).
++    pub ba: u32,
++}
++
++impl MeshVertex {
++    /// A vertex at `position` of `color`.
++    pub fn new(position: Point<f32>, color: Rgba) -> Self {
++        fn unorm16(v: f32) -> u32 {
++            (v.clamp(0., 1.) * 65535. + 0.5) as u32
++        }
++        Self {
++            position: [position.x, position.y],
++            rg: unorm16(color.r) | unorm16(color.g) << 16,
++            ba: unorm16(color.b) | unorm16(color.a) << 16,
++        }
++    }
++
++    /// The vertex position in mesh space.
++    pub fn position(&self) -> Point<f32> {
++        point(self.position[0], self.position[1])
++    }
++
++    /// The vertex colour (as stored: each channel rounded to 16 bits).
++    pub fn color(&self) -> Rgba {
++        let channel = |v: u32| (v & 0xffff) as f32 / 65535.;
++        Rgba {
++            r: channel(self.rg),
++            g: channel(self.rg >> 16),
++            b: channel(self.ba),
++            a: channel(self.ba >> 16),
++        }
++    }
++}
++
++/// An immutable triangle list with a colour per vertex, drawn with
++/// [`Window::paint_mesh`](crate::Window::paint_mesh).
++///
++/// Every three vertices are a triangle. Build a mesh once and paint it every frame: renderers
++/// upload it the first time it is painted and keep it on the GPU while it is in use (they drop
++/// it once every `Mesh` handle is gone, and may drop meshes that have not been painted for a
++/// while to stay within their memory budget, uploading them again if they are painted
++/// again). Cloning a mesh is cheap and keeps its identity.
++#[derive(Clone)]
++pub struct Mesh(Arc<MeshData>);
++
++struct MeshData {
++    id: MeshId,
++    vertices: Box<[MeshVertex]>,
++    bounds: Bounds<f32>,
++}
++
++static NEXT_MESH_ID: AtomicU64 = AtomicU64::new(1);
++
++impl Mesh {
++    /// A mesh of the triangles `vertices` makes (a trailing partial triangle is dropped).
++    pub fn new(vertices: impl IntoIterator<Item = MeshVertex>) -> Self {
++        let mut vertices: Vec<MeshVertex> = vertices.into_iter().collect();
++        vertices.truncate(vertices.len() / 3 * 3);
++        let mut min = point(f32::INFINITY, f32::INFINITY);
++        let mut max = point(f32::NEG_INFINITY, f32::NEG_INFINITY);
++        for v in &vertices {
++            let p = v.position();
++            min = point(min.x.min(p.x), min.y.min(p.y));
++            max = point(max.x.max(p.x), max.y.max(p.y));
++        }
++        let bounds = if vertices.is_empty() {
++            Bounds::default()
++        } else {
++            Bounds {
++                origin: min,
++                size: size(max.x - min.x, max.y - min.y),
++            }
++        };
++        Self(Arc::new(MeshData {
++            id: MeshId(NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed)),
++            vertices: vertices.into_boxed_slice(),
++            bounds,
++        }))
++    }
++
++    /// The mesh's identity: the same for every clone of it.
++    pub fn id(&self) -> MeshId {
++        self.0.id
++    }
++
++    /// The vertices; every three are a triangle.
++    pub fn vertices(&self) -> &[MeshVertex] {
++        &self.0.vertices
++    }
++
++    /// The number of vertices (a multiple of three).
++    pub fn len(&self) -> usize {
++        self.0.vertices.len()
++    }
++
++    /// Whether the mesh has no triangles.
++    pub fn is_empty(&self) -> bool {
++        self.0.vertices.is_empty()
++    }
++
++    /// The bounds of the vertices in mesh space.
++    pub fn bounds(&self) -> Bounds<f32> {
++        self.0.bounds
++    }
++
++    /// A handle that does not keep the mesh alive (renderers keep one per mesh they store, to
++    /// drop its GPU copy once the mesh is gone).
++    pub fn downgrade(&self) -> WeakMesh {
++        WeakMesh(Arc::downgrade(&self.0))
++    }
++}
++
++impl std::fmt::Debug for Mesh {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("Mesh")
++            .field("id", &self.0.id)
++            .field("vertices", &self.0.vertices.len())
++            .field("bounds", &self.0.bounds)
++            .finish()
++    }
++}
++
++impl PartialEq for Mesh {
++    fn eq(&self, other: &Self) -> bool {
++        Arc::ptr_eq(&self.0, &other.0)
++    }
++}
++
++/// A [`Mesh`] handle that does not keep it alive.
++#[derive(Clone, Debug)]
++pub struct WeakMesh(Weak<MeshData>);
++
++impl WeakMesh {
++    /// Whether every [`Mesh`] handle of this mesh has been dropped.
++    pub fn is_dropped(&self) -> bool {
++        self.0.strong_count() == 0
++    }
++
++    /// The mesh, if it is still alive.
++    pub fn upgrade(&self) -> Option<Mesh> {
++        self.0.upgrade().map(Mesh)
++    }
++}
++
++impl std::fmt::Debug for MeshData {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("MeshData").field("id", &self.id).finish()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_mesh_vertices_round_trip() {
++        let color = Rgba {
++            r: 0.25,
++            g: 1.0,
++            b: 0.0,
++            a: 0.5,
++        };
++        let v = MeshVertex::new(point(-3.5, 1e6), color);
++        assert_eq!(v.position(), point(-3.5, 1e6));
++        let c = v.color();
++        for (a, b) in [(c.r, 0.25), (c.g, 1.0), (c.b, 0.0), (c.a, 0.5)] {
++            assert!((a - b).abs() <= 0.5 / 65535., "{a} vs {b}");
++        }
++        // Out of range channels are clamped.
++        let v = MeshVertex::new(
++            point(0., 0.),
++            Rgba {
++                r: 2.0,
++                g: -1.0,
++                b: 0.5,
++                a: 1.0,
++            },
++        );
++        assert_eq!(v.color().r, 1.0);
++        assert_eq!(v.color().g, 0.0);
++    }
++
++    #[test]
++    fn test_mesh_bounds_identity_and_liveness() {
++        let white = Rgba {
++            r: 1.,
++            g: 1.,
++            b: 1.,
++            a: 1.,
++        };
++        let mesh = Mesh::new(
++            [
++                point(1., 2.),
++                point(5., -1.),
++                point(3., 7.),
++                point(100., 100.),
++            ]
++            .map(|p| MeshVertex::new(p, white)),
++        );
++        // The partial triangle is dropped.
++        assert_eq!(mesh.len(), 3);
++        assert_eq!(
++            mesh.bounds(),
++            Bounds {
++                origin: point(1., -1.),
++                size: size(4., 8.)
++            }
++        );
++        let other = Mesh::new([]);
++        assert!(other.is_empty());
++        assert_ne!(mesh.id(), other.id());
++        let clone = mesh.clone();
++        assert_eq!(clone.id(), mesh.id());
++        assert_eq!(clone, mesh);
++
++        let weak = mesh.downgrade();
++        drop(mesh);
++        assert!(!weak.is_dropped());
++        drop(clone);
++        assert!(weak.is_dropped());
++        assert!(weak.upgrade().is_none());
++    }
++
++    #[test]
++    fn test_mesh_draw_path_vertices() {
++        use crate::{Background, ContentMask, MeshDraw, ScaledPixels, TransformationMatrix};
++        let orange = Rgba {
++            r: 1.,
++            g: 0.5,
++            b: 0.,
++            a: 0.5,
++        };
++        let mesh = Mesh::new(
++            [point(0., 0.), point(10., 0.), point(0., 10.)].map(|p| MeshVertex::new(p, orange)),
++        );
++        let draw = MeshDraw {
++            order: 0,
++            bounds: Bounds::default(),
++            content_mask: ContentMask::default(),
++            transformation: TransformationMatrix {
++                rotation_scale: [[2., 0.], [0., 2.]],
++                translation: [5., 7.],
++            },
++            background: Background::from(Rgba {
++                r: 1.,
++                g: 1.,
++                b: 1.,
++                a: 0.5,
++            }),
++            mesh,
++        };
++        let vertices: Vec<_> = draw.path_vertices().collect();
++        assert_eq!(vertices.len(), 3);
++        assert_eq!(vertices[1].0, point(ScaledPixels(25.), ScaledPixels(7.)));
++        // The paint multiplies the vertex colour.
++        let color = Rgba::from(vertices[0].1.solid);
++        assert!((color.r - 1.).abs() < 1e-3 && (color.g - 0.5).abs() < 1e-3);
++        assert!((color.a - 0.25).abs() < 1e-3, "{color:?}");
++    }
++}
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index 22d56e7..44ae842 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -5,7 +5,7 @@ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::{
+-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
++    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Mesh, Pixels,
+     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+ };
+ use std::{
+@@ -45,6 +45,7 @@ pub struct Scene {
+     pub shadows: Vec<Shadow>,
+     pub quads: Vec<Quad>,
+     pub paths: Vec<Path<ScaledPixels>>,
++    pub meshes: Vec<MeshDraw>,
+     pub underlines: Vec<Underline>,
+     pub monochrome_sprites: Vec<MonochromeSprite>,
+     pub subpixel_sprites: Vec<SubpixelSprite>,
+@@ -59,6 +60,7 @@ impl Scene {
+         self.primitive_bounds.clear();
+         self.layer_stack.clear();
+         self.paths.clear();
++        self.meshes.clear();
+         self.shadows.clear();
+         self.quads.clear();
+         self.underlines.clear();
+@@ -113,6 +115,10 @@ impl Scene {
+                 path.id = PathId(self.paths.len());
+                 self.paths.push(path.clone());
+             }
++            Primitive::Mesh(mesh) => {
++                mesh.order = order;
++                self.meshes.push(mesh.clone());
++            }
+             Primitive::Underline(underline) => {
+                 underline.order = order;
+                 self.underlines.push(*underline);
+@@ -152,6 +158,7 @@ impl Scene {
+         self.shadows.sort_by_key(|shadow| shadow.order);
+         self.quads.sort_by_key(|quad| quad.order);
+         self.paths.sort_by_key(|path| path.order);
++        self.meshes.sort_by_key(|mesh| mesh.order);
+         self.underlines.sort_by_key(|underline| underline.order);
+         self.monochrome_sprites
+             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+@@ -177,6 +184,8 @@ impl Scene {
+             quads_iter: self.quads.iter().peekable(),
+             paths_start: 0,
+             paths_iter: self.paths.iter().peekable(),
++            meshes_start: 0,
++            meshes_iter: self.meshes.iter().peekable(),
+             underlines_start: 0,
+             underlines_iter: self.underlines.iter().peekable(),
+             monochrome_sprites_start: 0,
+@@ -204,6 +213,7 @@ pub(crate) enum PrimitiveKind {
+     #[default]
+     Quad,
+     Path,
++    Mesh,
+     Underline,
+     MonochromeSprite,
+     SubpixelSprite,
+@@ -223,6 +233,7 @@ pub enum Primitive {
+     Shadow(Shadow),
+     Quad(Quad),
+     Path(Path<ScaledPixels>),
++    Mesh(MeshDraw),
+     Underline(Underline),
+     MonochromeSprite(MonochromeSprite),
+     SubpixelSprite(SubpixelSprite),
+@@ -237,6 +248,7 @@ impl Primitive {
+             Primitive::Shadow(shadow) => &shadow.bounds,
+             Primitive::Quad(quad) => &quad.bounds,
+             Primitive::Path(path) => &path.bounds,
++            Primitive::Mesh(mesh) => &mesh.bounds,
+             Primitive::Underline(underline) => &underline.bounds,
+             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
+             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
+@@ -271,6 +283,7 @@ impl Primitive {
+             Primitive::Shadow(shadow) => &shadow.content_mask,
+             Primitive::Quad(quad) => &quad.content_mask,
+             Primitive::Path(path) => &path.content_mask,
++            Primitive::Mesh(mesh) => &mesh.content_mask,
+             Primitive::Underline(underline) => &underline.content_mask,
+             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
+             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
+@@ -294,6 +307,8 @@ struct BatchIterator<'a> {
+     quads_iter: Peekable<slice::Iter<'a, Quad>>,
+     paths_start: usize,
+     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
++    meshes_start: usize,
++    meshes_iter: Peekable<slice::Iter<'a, MeshDraw>>,
+     underlines_start: usize,
+     underlines_iter: Peekable<slice::Iter<'a, Underline>>,
+     monochrome_sprites_start: usize,
+@@ -317,6 +332,10 @@ impl<'a> Iterator for BatchIterator<'a> {
+             ),
+             (self.quads_iter.peek().map(|q| q.order), PrimitiveKind::Quad),
+             (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
++            (
++                self.meshes_iter.peek().map(|m| m.order),
++                PrimitiveKind::Mesh,
++            ),
+             (
+                 self.underlines_iter.peek().map(|u| u.order),
+                 PrimitiveKind::Underline,
+@@ -391,6 +410,20 @@ impl<'a> Iterator for BatchIterator<'a> {
+                 self.paths_start = paths_end;
+                 Some(PrimitiveBatch::Paths(paths_start..paths_end))
+             }
++            PrimitiveKind::Mesh => {
++                let meshes_start = self.meshes_start;
++                let mut meshes_end = meshes_start + 1;
++                self.meshes_iter.next();
++                while self
++                    .meshes_iter
++                    .next_if(|mesh| (mesh.order, batch_kind) < max_order_and_kind)
++                    .is_some()
++                {
++                    meshes_end += 1;
++                }
++                self.meshes_start = meshes_end;
++                Some(PrimitiveBatch::Meshes(meshes_start..meshes_end))
++            }
+             PrimitiveKind::Underline => {
+                 let underlines_start = self.underlines_start;
+                 let mut underlines_end = underlines_start + 1;
+@@ -486,7 +519,7 @@ impl<'a> Iterator for BatchIterator<'a> {
+     }
+ }
+ 
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ #[cfg_attr(
+     all(
+         any(target_os = "linux", target_os = "freebsd"),
+@@ -499,6 +532,8 @@ pub enum PrimitiveBatch {
+     Shadows(Range<usize>),
+     Quads(Range<usize>),
+     Paths(Range<usize>),
++    /// Meshes (`Scene::meshes`), rasterized in order like a batch of paths.
++    Meshes(Range<usize>),
+     Underlines(Range<usize>),
+     MonochromeSprites {
+         texture_id: AtlasTextureId,
+@@ -523,6 +558,7 @@ impl PrimitiveBatch {
+             Self::Shadows(range) => format!("shadows ({})", range.len()),
+             Self::Quads(range) => format!("quads ({})", range.len()),
+             Self::Paths(range) => format!("paths ({})", range.len()),
++            Self::Meshes(range) => format!("meshes ({})", range.len()),
+             Self::Underlines(range) => format!("underlines ({})", range.len()),
+             Self::MonochromeSprites { texture_id, range } => {
+                 format!(
+@@ -858,6 +894,70 @@ impl From<PaintSurface> for Primitive {
+ #[expect(missing_docs)]
+ pub struct PathId(pub usize);
+ 
++/// A [`Mesh`] painted with a transformation and paint (see [`crate::Window::paint_mesh`]).
++#[derive(Clone, Debug)]
++pub struct MeshDraw {
++    /// The draw order, assigned when the draw is inserted into a scene.
++    pub order: DrawOrder,
++    /// The area the draw may paint: the transformed mesh bounds, rounded out to whole device
++    /// pixels.
++    pub bounds: Bounds<ScaledPixels>,
++    /// The clip.
++    pub content_mask: ContentMask<ScaledPixels>,
++    /// Mesh space → scaled pixels.
++    pub transformation: TransformationMatrix,
++    /// What the vertex colours are multiplied by, for scaled pixels (see
++    /// [`crate::Window::paint_mesh`]).
++    pub background: Background,
++    /// The geometry.
++    pub mesh: Mesh,
++}
++
++impl MeshDraw {
++    /// The part of the scene the draw may paint: its bounds within its clip.
++    pub fn clipped_bounds(&self) -> Bounds<ScaledPixels> {
++        self.bounds.intersect(&self.content_mask.bounds)
++    }
++
++    /// The draw's triangles as path vertices in scaled pixels, each with its paint: for
++    /// renderers that rasterize meshes through their path pipeline instead of keeping them on
++    /// the GPU. A solid paint is multiplied by the vertex colour exactly; a pattern or
++    /// gradient takes the vertex alpha (meshes painted with one have white vertices).
++    pub fn path_vertices(&self) -> impl Iterator<Item = (Point<ScaledPixels>, Background)> + '_ {
++        let m = self.transformation;
++        let solid = (self.background.tag == crate::BackgroundTag::Solid)
++            .then(|| crate::Rgba::from(self.background.solid));
++        self.mesh.vertices().iter().map(move |vertex| {
++            let [x, y] = vertex.position;
++            let position = point(
++                ScaledPixels(
++                    m.rotation_scale[0][0] * x + m.rotation_scale[0][1] * y + m.translation[0],
++                ),
++                ScaledPixels(
++                    m.rotation_scale[1][0] * x + m.rotation_scale[1][1] * y + m.translation[1],
++                ),
++            );
++            let color = vertex.color();
++            let paint = match solid {
++                Some(paint) => Background::from(Hsla::from(crate::Rgba {
++                    r: paint.r * color.r,
++                    g: paint.g * color.g,
++                    b: paint.b * color.b,
++                    a: paint.a * color.a,
++                })),
++                None => self.background.opacity(color.a),
++            };
++            (position, paint)
++        })
++    }
++}
++
++impl From<MeshDraw> for Primitive {
++    fn from(mesh: MeshDraw) -> Self {
++        Primitive::Mesh(mesh)
++    }
++}
++
+ /// A line made up of a series of vertices and control points.
+ #[derive(Clone, Debug)]
+ #[expect(missing_docs)]
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index adf16fd..0c663c4 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -11,18 +11,19 @@ use crate::{
+     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+     EntityId, EventEmitter, FileDropEvent, FontId, FontSmoothing, Global, GlobalElementId, GlyphId,
+     GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
+-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
++    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Mesh, MeshDraw, Modifiers,
++    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
++    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
++    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
++    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
++    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
++    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
++    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
++    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
++    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
++    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
++    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems,
++    size, transparent_black,
+ };
+ 
+ use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
+@@ -2711,6 +2712,14 @@ impl Window {
+             .render_to_image(&self.rendered_frame.scene)
+     }
+ 
++    /// Renders the most recently drawn frame the way presenting it does (the platform encodes
++    /// and submits it without waiting for the GPU), for benchmarks of windows that are not on
++    /// screen.
++    #[cfg(any(test, feature = "test-support"))]
++    pub fn render_offscreen(&self) {
++        self.platform_window.draw(&self.rendered_frame.scene);
++    }
++
+     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
+     /// painted output without rasterizing the frame. Quad bounds are in scaled pixels and are
+     /// not clipped; each quad carries the content mask it will be clipped to when drawn. Quads
+@@ -4719,6 +4728,73 @@ impl Window {
+             .insert_primitive(path.scale(scale_factor));
+     }
+ 
++    /// Paint a [`Mesh`] into the scene for the next frame at the current z-index.
++    ///
++    /// `transformation` maps mesh space to window pixels (the space element bounds are in).
++    /// Each triangle is filled with its vertices' colour multiplied by `paint`: solid white
++    /// draws the vertex colours as they are, translucent white fades them, and a pattern or
++    /// gradient is drawn in them (white vertices draw it as it is; a gradient spans the
++    /// draw's bounds within the content mask, as a path's does). Meshes are anti-aliased
++    /// the way paths are, by multisampling, and rasterized in paint order with them.
++    ///
++    /// The mesh is uploaded to the GPU the first time it is painted and stays there while it
++    /// is in use, so painting it again costs the same whatever its size.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_mesh(
++        &mut self,
++        mesh: &Mesh,
++        transformation: TransformationMatrix,
++        paint: impl Into<Background>,
++    ) {
++        self.invalidator.debug_assert_paint();
++        if mesh.is_empty() {
++            return;
++        }
++        let scale_factor = self.scale_factor();
++        let transformation = TransformationMatrix {
++            rotation_scale: transformation
++                .rotation_scale
++                .map(|row| row.map(|value| value * scale_factor)),
++            translation: transformation.translation.map(|value| value * scale_factor),
++        };
++        let mesh_bounds = mesh.bounds();
++        let transformed = transformation.transform_bounds(Bounds {
++            origin: mesh_bounds.origin.map(ScaledPixels),
++            size: mesh_bounds.size.map(ScaledPixels),
++        });
++        let (top_left, bottom_right) = (transformed.origin, transformed.bottom_right());
++        if ![top_left.x, top_left.y, bottom_right.x, bottom_right.y]
++            .iter()
++            .all(|value| value.0.is_finite())
++        {
++            return;
++        }
++        // Whole device pixels, so compositing the multisampled triangles never cuts off the
++        // anti-aliased pixels at their edges.
++        let bounds = Bounds::from_corners(
++            point(
++                ScaledPixels(top_left.x.0.floor()),
++                ScaledPixels(top_left.y.0.floor()),
++            ),
++            point(
++                ScaledPixels(bottom_right.x.0.ceil()),
++                ScaledPixels(bottom_right.y.0.ceil()),
++            ),
++        );
++        let paint: Background = paint.into();
++        let opacity = self.element_opacity();
++        let content_mask = self.content_mask().scale(scale_factor);
++        self.next_frame.scene.insert_primitive(MeshDraw {
++            order: 0,
++            bounds,
++            content_mask,
++            transformation,
++            background: paint.opacity(opacity).scale(scale_factor),
++            mesh: mesh.clone(),
++        });
++    }
++
+     /// Paint an underline into the scene for the next frame at the current z-index.
+     ///
+     /// This method should only be called as part of the paint phase of element drawing.
+diff --git a/crates/gpui_apple/Cargo.toml b/crates/gpui_apple/Cargo.toml
+index 33ec05f..a8c8b56 100644
+--- a/crates/gpui_apple/Cargo.toml
++++ b/crates/gpui_apple/Cargo.toml
+@@ -25,6 +25,7 @@ gpui.workspace = true
+ anyhow.workspace = true
+ block2.workspace = true
+ cocoa.workspace = true
++collections.workspace = true
+ core-foundation.workspace = true
+ core-video.workspace = true
+ derive_more.workspace = true
+diff --git a/crates/gpui_apple/build.rs b/crates/gpui_apple/build.rs
+index 993ba06..da59be1 100644
+--- a/crates/gpui_apple/build.rs
++++ b/crates/gpui_apple/build.rs
+@@ -48,6 +48,10 @@ mod macos_build {
+             "PathRasterizationInputIndex".into(),
+             "PathVertex_ScaledPixels".into(),
+             "PathRasterizationVertex".into(),
++            "MeshInputIndex".into(),
++            "MeshVertex".into(),
++            "MeshDrawInstance".into(),
++            "MeshChunk".into(),
+             "ShadowInputIndex".into(),
+             "Shadow".into(),
+             "QuadInputIndex".into(),
+@@ -73,6 +77,7 @@ mod macos_build {
+         // Source files from gpui that define types used in shaders
+         let gpui_src_paths = [
+             gpui_dir.join("src/scene.rs"),
++            gpui_dir.join("src/mesh.rs"),
+             gpui_dir.join("src/geometry.rs"),
+             gpui_dir.join("src/color.rs"),
+             gpui_dir.join("src/window.rs"),
+diff --git a/crates/gpui_apple/src/gpui_apple.rs b/crates/gpui_apple/src/gpui_apple.rs
+index 208d297..1b4ec12 100644
+--- a/crates/gpui_apple/src/gpui_apple.rs
++++ b/crates/gpui_apple/src/gpui_apple.rs
+@@ -5,4 +5,5 @@
+ //! by GPUI's Apple platform backends.
+ 
+ mod metal_atlas;
++mod metal_meshes;
+ pub mod metal_renderer;
+diff --git a/crates/gpui_apple/src/metal_meshes.rs b/crates/gpui_apple/src/metal_meshes.rs
+new file mode 100644
+index 0000000..c7f968a
+--- /dev/null
++++ b/crates/gpui_apple/src/metal_meshes.rs
+@@ -0,0 +1,387 @@
++//! GPU storage for retained meshes (`Window::paint_mesh`).
++//!
++//! Every mesh painted in a frame is kept in a few shared vertex buffers ("pages"), in blocks of
++//! [`MESH_BLOCK_VERTICES`] vertices that need not be contiguous: a draw is rasterized as one
++//! instance per block (see `mesh_vertex` in the shaders), so a frame of meshes costs one
++//! instanced draw call and a few bytes per block, whatever the vertices. Blocks are allocated
++//! from a free list (no fragmentation), and a mesh's blocks are reused only once the frames
++//! that drew it have completed on the GPU. When the pages are full a bigger one is added
++//! (nothing is copied), up to [`MAX_PAGES`].
++//!
++//! A mesh stays stored while any `Mesh` handle to it is alive; beyond the memory budget the
++//! meshes painted longest ago are dropped first (and uploaded again if they are painted again).
++
++use std::sync::{
++    Arc,
++    atomic::{AtomicU64, Ordering},
++};
++
++use anyhow::Result;
++use collections::{FxHashMap, VecDeque};
++use gpui::{Mesh, MeshId, MeshVertex, WeakMesh};
++use metal::{MTLResourceOptions, NSRange};
++
++/// Vertices per block: whole triangles.
++pub(crate) const MESH_BLOCK_VERTICES: u32 = 48;
++const BLOCK_BYTES: u64 = MESH_BLOCK_VERTICES as u64 * size_of::<MeshVertex>() as u64;
++/// The vertex buffers the mesh shaders can read.
++pub(crate) const MAX_PAGES: usize = 8;
++/// The first page's size in blocks (3 MB); each next one is twice as big, up to
++/// [`MAX_PAGE_BLOCKS`].
++const FIRST_PAGE_BLOCKS: u32 = 1 << 12;
++const MAX_PAGE_BLOCKS: u32 = 1 << 17;
++/// Above this many bytes of blocks in use, meshes that were not painted in the current frame
++/// are dropped (least recently painted first) before another page is added.
++const BUDGET_BYTES: u64 = 256 << 20;
++/// How often (in frames) meshes whose handles were all dropped are released.
++const SWEEP_FRAMES: u64 = 32;
++
++/// A block of a page: where a mesh's vertices [`MESH_BLOCK_VERTICES`] at a time are.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Block {
++    pub page: u32,
++    /// The block's first vertex in its page.
++    pub first_vertex: u32,
++}
++
++struct Page {
++    buffer: metal::Buffer,
++    /// Capacity in blocks.
++    blocks: u32,
++    /// Blocks handed out at least once; the ones above are unused.
++    high_water: u32,
++}
++
++struct StoredMesh {
++    blocks: Vec<Block>,
++    last_used: u64,
++    mesh: WeakMesh,
++}
++
++pub(crate) struct MeshStore {
++    device: metal::Device,
++    unified_memory: bool,
++    pages: Vec<Page>,
++    free: Vec<Block>,
++    /// Released blocks and the last frame that may still read them.
++    retired: VecDeque<(u64, Vec<Block>)>,
++    meshes: FxHashMap<MeshId, StoredMesh>,
++    /// Blocks in use (stored or retired).
++    used: u64,
++    frame: u64,
++    /// The last frame the GPU completed (set by command buffer completion handlers).
++    completed: Arc<AtomicU64>,
++    failed: bool,
++}
++
++impl MeshStore {
++    pub(crate) fn new(device: metal::Device, unified_memory: bool) -> Self {
++        Self {
++            device,
++            unified_memory,
++            pages: Vec::new(),
++            free: Vec::new(),
++            retired: VecDeque::new(),
++            meshes: FxHashMap::default(),
++            used: 0,
++            frame: 0,
++            completed: Arc::new(AtomicU64::new(0)),
++            failed: false,
++        }
++    }
++
++    /// Starts a frame: stores every mesh `meshes` paints (uploading those it does not hold
++    /// yet). Returns the frame's number, which the frame's command buffer reports to
++    /// [`Self::completion`] once the GPU is done with it.
++    pub(crate) fn begin_frame<'a>(&mut self, meshes: impl Iterator<Item = &'a Mesh>) -> u64 {
++        self.frame += 1;
++        self.reclaim();
++        if self.frame.is_multiple_of(SWEEP_FRAMES) {
++            self.release_dropped();
++        }
++        for mesh in meshes {
++            if let Err(error) = self.ensure(mesh) {
++                if !self.failed {
++                    log::error!("mesh not drawn: {error:#}");
++                    self.failed = true;
++                }
++            }
++        }
++        self.frame
++    }
++
++    /// The counter command buffer completion handlers advance to their frame's number.
++    pub(crate) fn completion(&self) -> Arc<AtomicU64> {
++        self.completed.clone()
++    }
++
++    /// The vertex buffers, in page order.
++    pub(crate) fn pages(&self) -> impl Iterator<Item = &metal::Buffer> {
++        self.pages.iter().map(|page| &page.buffer)
++    }
++
++    /// The blocks holding a stored mesh, in order.
++    pub(crate) fn blocks(&self, id: MeshId) -> Option<&[Block]> {
++        self.meshes.get(&id).map(|stored| stored.blocks.as_slice())
++    }
++
++    /// Stored meshes, blocks in use, and the pages' size in bytes.
++    #[allow(dead_code)]
++    pub(crate) fn usage(&self) -> (usize, u64, u64) {
++        (
++            self.meshes.len(),
++            self.used,
++            self.pages
++                .iter()
++                .map(|page| u64::from(page.blocks) * BLOCK_BYTES)
++                .sum(),
++        )
++    }
++
++    fn ensure(&mut self, mesh: &Mesh) -> Result<()> {
++        if let Some(stored) = self.meshes.get_mut(&mesh.id()) {
++            stored.last_used = self.frame;
++            return Ok(());
++        }
++        let needed = mesh.len().div_ceil(MESH_BLOCK_VERTICES as usize) as u32;
++        let blocks = self.allocate(needed)?;
++        self.upload(mesh.vertices(), &blocks);
++        self.meshes.insert(
++            mesh.id(),
++            StoredMesh {
++                blocks,
++                last_used: self.frame,
++                mesh: mesh.downgrade(),
++            },
++        );
++        Ok(())
++    }
++
++    fn available(&self) -> u64 {
++        self.free.len() as u64
++            + self
++                .pages
++                .iter()
++                .map(|page| u64::from(page.blocks - page.high_water))
++                .sum::<u64>()
++    }
++
++    fn allocate(&mut self, count: u32) -> Result<Vec<Block>> {
++        if self.available() < u64::from(count) {
++            if (self.used + u64::from(count)) * BLOCK_BYTES > BUDGET_BYTES {
++                self.evict_least_recently_used(count);
++            }
++            while self.available() < u64::from(count) {
++                self.add_page()?;
++            }
++        }
++        let mut blocks = Vec::with_capacity(count as usize);
++        for _ in 0..count {
++            let block = match self.free.pop() {
++                Some(block) => block,
++                None => {
++                    let (index, page) = self
++                        .pages
++                        .iter_mut()
++                        .enumerate()
++                        .find(|(_, page)| page.high_water < page.blocks)
++                        .ok_or_else(|| anyhow::anyhow!("mesh pages are full"))?;
++                    page.high_water += 1;
++                    Block {
++                        page: index as u32,
++                        first_vertex: (page.high_water - 1) * MESH_BLOCK_VERTICES,
++                    }
++                }
++            };
++            blocks.push(block);
++        }
++        self.used += u64::from(count);
++        Ok(blocks)
++    }
++
++    /// Adds a page twice as big as the last one (the first is small).
++    fn add_page(&mut self) -> Result<()> {
++        anyhow::ensure!(
++            self.pages.len() < MAX_PAGES,
++            "meshes need more than {MAX_PAGES} pages"
++        );
++        let blocks = self.pages.last().map_or(FIRST_PAGE_BLOCKS, |page| {
++            (page.blocks * 2).min(MAX_PAGE_BLOCKS)
++        });
++        let options = if self.unified_memory {
++            MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeWriteCombined
++        } else {
++            MTLResourceOptions::StorageModeManaged
++        };
++        let buffer = self
++            .device
++            .new_buffer(u64::from(blocks) * BLOCK_BYTES, options);
++        log::debug!(
++            "mesh page {}: {} MB",
++            self.pages.len(),
++            (u64::from(blocks) * BLOCK_BYTES) >> 20
++        );
++        self.pages.push(Page {
++            buffer,
++            blocks,
++            high_water: 0,
++        });
++        Ok(())
++    }
++
++    /// Copies `vertices` into `blocks`.
++    fn upload(&self, vertices: &[MeshVertex], blocks: &[Block]) {
++        for (chunk, block) in vertices.chunks(MESH_BLOCK_VERTICES as usize).zip(blocks) {
++            let buffer = &self.pages[block.page as usize].buffer;
++            let base = buffer.contents().cast::<MeshVertex>();
++            // SAFETY: `block` lies within its page, which holds `MESH_BLOCK_VERTICES` vertices
++            // from `first_vertex`; no frame the GPU may still be running reads it (blocks are
++            // reused only after the frames that drew them completed).
++            unsafe {
++                std::ptr::copy_nonoverlapping(
++                    chunk.as_ptr(),
++                    base.add(block.first_vertex as usize),
++                    chunk.len(),
++                );
++            }
++            if !self.unified_memory {
++                buffer.did_modify_range(NSRange {
++                    location: u64::from(block.first_vertex) * size_of::<MeshVertex>() as u64,
++                    length: (chunk.len() * size_of::<MeshVertex>()) as u64,
++                });
++            }
++        }
++    }
++
++    /// Drops meshes not painted in this frame, least recently painted first, until `count`
++    /// blocks are free or a quarter of the budget was released.
++    fn evict_least_recently_used(&mut self, count: u32) {
++        let frame = self.frame;
++        let mut candidates: Vec<(u64, MeshId)> = self
++            .meshes
++            .iter()
++            .filter(|(_, stored)| stored.last_used < frame)
++            .map(|(id, stored)| (stored.last_used, *id))
++            .collect();
++        candidates.sort_unstable();
++        let target = u64::from(count).max(BUDGET_BYTES / BLOCK_BYTES / 4);
++        let mut released = 0u64;
++        for (_, id) in candidates {
++            if released >= target {
++                break;
++            }
++            if let Some(stored) = self.meshes.remove(&id) {
++                released += stored.blocks.len() as u64;
++                self.retired.push_back((stored.last_used, stored.blocks));
++            }
++        }
++        self.reclaim();
++    }
++
++    /// Releases the meshes whose handles were all dropped.
++    fn release_dropped(&mut self) {
++        let dropped: Vec<MeshId> = self
++            .meshes
++            .iter()
++            .filter(|(_, stored)| stored.mesh.is_dropped())
++            .map(|(id, _)| *id)
++            .collect();
++        for id in dropped {
++            if let Some(stored) = self.meshes.remove(&id) {
++                self.retired.push_back((stored.last_used, stored.blocks));
++            }
++        }
++    }
++
++    /// Frees retired blocks the GPU is done with.
++    fn reclaim(&mut self) {
++        let completed = self.completed.load(Ordering::Acquire);
++        let mut kept = VecDeque::new();
++        while let Some((last_used, blocks)) = self.retired.pop_front() {
++            if last_used <= completed {
++                self.used -= blocks.len() as u64;
++                self.free.extend(blocks);
++            } else {
++                kept.push_back((last_used, blocks));
++            }
++        }
++        self.retired = kept;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use gpui::{Rgba, point};
++
++    fn rgba(r: f32, g: f32, b: f32, a: f32) -> Rgba {
++        Rgba { r, g, b, a }
++    }
++
++    #[test]
++    fn test_mesh_blocks_are_reused_only_after_their_frames_completed() {
++        let Some(device) = metal::Device::system_default() else {
++            return;
++        };
++        let mut store = MeshStore::new(device, true);
++        let color = rgba(1., 1., 1., 1.);
++        // 102 vertices: three blocks
++        let big = Mesh::new((0..102).map(|i| MeshVertex::new(point(i as f32, 0.), color)));
++        let frame = store.begin_frame([&big].into_iter());
++        let blocks = store.blocks(big.id()).expect("stored").to_vec();
++        assert_eq!(blocks.len(), 3);
++        let id = big.id();
++        drop(big);
++        // Released at the next sweep, but the GPU has not completed the frame yet.
++        for _ in 0..SWEEP_FRAMES {
++            store.begin_frame(std::iter::empty());
++        }
++        assert!(store.blocks(id).is_none());
++        let other = Mesh::new((0..3).map(|i| MeshVertex::new(point(i as f32, 1.), color)));
++        store.begin_frame([&other].into_iter());
++        let reused = store.blocks(other.id()).expect("stored")[0];
++        assert!(
++            !blocks.contains(&reused),
++            "a block the GPU may still read was reused"
++        );
++        // Once the frame completed its blocks are free again.
++        store.completion().store(frame, Ordering::Release);
++        let third = Mesh::new((0..3).map(|i| MeshVertex::new(point(i as f32, 2.), color)));
++        store.begin_frame([&third].into_iter());
++        assert!(blocks.contains(&store.blocks(third.id()).expect("stored")[0]));
++    }
++
++    #[test]
++    fn test_mesh_pages_are_added_without_moving_stored_meshes() {
++        let Some(device) = metal::Device::system_default() else {
++            return;
++        };
++        let mut store = MeshStore::new(device, true);
++        let color = rgba(0.25, 0.5, 0.75, 1.);
++        // More than the first page holds.
++        let vertices = (FIRST_PAGE_BLOCKS as usize + 10) * MESH_BLOCK_VERTICES as usize;
++        let first = Mesh::new((0..48).map(|i| MeshVertex::new(point(i as f32, 0.), color)));
++        store.begin_frame([&first].into_iter());
++        let first_blocks = store.blocks(first.id()).expect("stored").to_vec();
++        let big = Mesh::new((0..vertices).map(|i| MeshVertex::new(point(i as f32, 1.), color)));
++        store.begin_frame([&first, &big].into_iter());
++        assert_eq!(store.pages().count(), 2, "a second page");
++        assert_eq!(
++            store.blocks(first.id()).expect("stored"),
++            first_blocks,
++            "the first mesh did not move"
++        );
++        // The vertices are where the blocks say.
++        let blocks = store.blocks(big.id()).expect("stored");
++        let last = blocks.last().expect("blocks");
++        let page = store.pages().nth(last.page as usize).expect("page");
++        let stored = unsafe {
++            *page
++                .contents()
++                .cast::<MeshVertex>()
++                .add(last.first_vertex as usize)
++        };
++        let expected = big.vertices()[(blocks.len() - 1) * MESH_BLOCK_VERTICES as usize];
++        assert_eq!(stored, expected);
++    }
++}
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index eddb3c1..74554f1 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -1,4 +1,5 @@
+ use crate::metal_atlas::MetalAtlas;
++use crate::metal_meshes::{MAX_PAGES, MESH_BLOCK_VERTICES, MeshStore};
+ use anyhow::{Context as _, Result};
+ use block2::RcBlock;
+ use cocoa::{
+@@ -7,8 +8,8 @@ use cocoa::{
+     quartzcore::AutoresizingMask,
+ };
+ use gpui::{
+-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
+-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
++    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MeshDraw, PaintSurface, Path,
++    Point, PrimitiveBatch, ScaledPixels, Scene, Size, TransformationMatrix, point, size,
+ };
+ #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+ use image::RgbaImage;
+@@ -26,7 +27,15 @@ use metal::{
+ use objc::{self, msg_send, sel, sel_impl};
+ use parking_lot::Mutex;
+ 
+-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
++use std::{
++    cell::Cell,
++    ffi::c_void,
++    mem,
++    mem::MaybeUninit,
++    ops::Range,
++    ptr, slice,
++    sync::{Arc, atomic::Ordering},
++};
+ 
+ // Exported to metal
+ pub(crate) type PointF = gpui::Point<f32>;
+@@ -120,17 +129,22 @@ pub struct MetalRenderer {
+     opaque: bool,
+     command_queue: CommandQueue,
+     paths_rasterization_pipeline_state: metal::RenderPipelineState,
++    meshes_rasterization_pipeline_state: metal::RenderPipelineState,
+     path_sprites_pipeline_state: metal::RenderPipelineState,
+     shadows_pipeline_state: metal::RenderPipelineState,
+     quads_pipeline_state: metal::RenderPipelineState,
+     underlines_pipeline_state: metal::RenderPipelineState,
+     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
+     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
++    /// Sprites rasterized into the path texture with the meshes around them.
++    intermediate_monochrome_sprites_pipeline_state: metal::RenderPipelineState,
++    intermediate_polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+     surfaces_pipeline_state: metal::RenderPipelineState,
+     unit_vertices: metal::Buffer,
+     #[allow(clippy::arc_with_non_send_sync)]
+     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+     sprite_atlas: Arc<MetalAtlas>,
++    mesh_store: MeshStore,
+     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+     path_intermediate_texture: Option<metal::Texture>,
+     path_intermediate_msaa_texture: Option<metal::Texture>,
+@@ -149,6 +163,29 @@ pub struct PathRasterizationVertex {
+     pub bounds: Bounds<ScaledPixels>,
+ }
+ 
++/// A mesh draw as the mesh shaders read it.
++#[repr(C)]
++pub struct MeshDrawInstance {
++    pub transformation: TransformationMatrix,
++    pub background: Background,
++    pub bounds: Bounds<ScaledPixels>,
++    pub clip_bounds: Bounds<ScaledPixels>,
++    /// The draw's first chunk (its chunks are consecutive).
++    pub first_chunk: u32,
++    pub vertex_count: u32,
++}
++
++/// One instance of a mesh batch's draw call: a block of a draw's mesh.
++#[repr(C)]
++pub struct MeshChunk {
++    /// Index into the batch's draws.
++    pub draw: u32,
++    /// The vertex buffer ("page") holding the block.
++    pub page: u32,
++    /// Where the block starts in its page, in vertices.
++    pub first_vertex: u32,
++}
++
+ impl MetalRenderer {
+     /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
+     pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
+@@ -268,6 +305,15 @@ impl MetalRenderer {
+             MTLPixelFormat::BGRA8Unorm,
+             PATH_SAMPLE_COUNT,
+         );
++        let meshes_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
++            &device,
++            &library,
++            "meshes_rasterization",
++            "mesh_vertex",
++            "mesh_fragment",
++            MTLPixelFormat::BGRA8Unorm,
++            PATH_SAMPLE_COUNT,
++        );
+         let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
+             &device,
+             &library,
+@@ -316,6 +362,24 @@ impl MetalRenderer {
+             "polychrome_sprite_fragment",
+             MTLPixelFormat::BGRA8Unorm,
+         );
++        let intermediate_monochrome_sprites_pipeline_state =
++            build_intermediate_sprite_pipeline_state(
++                &device,
++                &library,
++                "intermediate_monochrome_sprites",
++                "monochrome_sprite_vertex",
++                "monochrome_sprite_fragment",
++                PATH_SAMPLE_COUNT,
++            );
++        let intermediate_polychrome_sprites_pipeline_state =
++            build_intermediate_sprite_pipeline_state(
++                &device,
++                &library,
++                "intermediate_polychrome_sprites",
++                "polychrome_sprite_vertex",
++                "polychrome_sprite_fragment",
++                PATH_SAMPLE_COUNT,
++            );
+         let surfaces_pipeline_state = build_pipeline_state(
+             &device,
+             &library,
+@@ -327,6 +391,7 @@ impl MetalRenderer {
+ 
+         let command_queue = device.new_command_queue();
+         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
++        let mesh_store = MeshStore::new(device.clone(), is_unified_memory);
+         let core_video_texture_cache =
+             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
+ 
+@@ -339,16 +404,20 @@ impl MetalRenderer {
+             opaque,
+             command_queue,
+             paths_rasterization_pipeline_state,
++            meshes_rasterization_pipeline_state,
+             path_sprites_pipeline_state,
+             shadows_pipeline_state,
+             quads_pipeline_state,
+             underlines_pipeline_state,
+             monochrome_sprites_pipeline_state,
+             polychrome_sprites_pipeline_state,
++            intermediate_monochrome_sprites_pipeline_state,
++            intermediate_polychrome_sprites_pipeline_state,
+             surfaces_pipeline_state,
+             unit_vertices,
+             instance_buffer_pool,
+             sprite_atlas,
++            mesh_store,
+             core_video_texture_cache,
+             path_intermediate_texture: None,
+             path_intermediate_msaa_texture: None,
+@@ -494,6 +563,9 @@ impl MetalRenderer {
+         texture: &metal::TextureRef,
+         viewport_size: Size<DevicePixels>,
+     ) -> Result<metal::CommandBuffer> {
++        let frame = self
++            .mesh_store
++            .begin_frame(scene.meshes.iter().map(|draw| &draw.mesh));
+         let mut writer = InstanceBufferWriter::new(
+             &self.device,
+             &self.instance_buffer_pool,
+@@ -501,8 +573,9 @@ impl MetalRenderer {
+         );
+         let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
+             format!(
+-                "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
++                "scene too large: {} paths, {} meshes, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                 scene.paths.len(),
++                scene.meshes.len(),
+                 scene.shadows.len(),
+                 scene.quads.len(),
+                 scene.underlines.len(),
+@@ -521,10 +594,12 @@ impl MetalRenderer {
+ 
+         let instance_buffer_pool = self.instance_buffer_pool.clone();
+         let instance_buffer = Cell::new(Some(writer.finish()));
++        let completed_frame = self.mesh_store.completion();
+         let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
+             if let Some(instance_buffer) = instance_buffer.take() {
+                 instance_buffer_pool.lock().release(instance_buffer);
+             }
++            completed_frame.fetch_max(frame, Ordering::Release);
+         });
+         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
+         unsafe {
+@@ -677,8 +752,11 @@ impl MetalRenderer {
+             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
+         );
+ 
+-        for batch in scene.batches() {
+-            match batch {
++        let batches: Vec<PrimitiveBatch> = scene.batches().collect();
++        let mut next = 0;
++        while let Some(batch) = batches.get(next) {
++            next += 1;
++            match batch.clone() {
+                 PrimitiveBatch::Shadows(range) => {
+                     self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
+                 }
+@@ -715,6 +793,53 @@ impl MetalRenderer {
+                         }
+                     }
+                 }
++                PrimitiveBatch::Meshes(_) => {
++                    // Sprites painted between meshes (a canvas's text) are rasterized with them,
++                    // in order, so that interleaved meshes and text cost one pass.
++                    let start = next - 1;
++                    let mut end = next;
++                    while let Some(batch) = batches.get(next) {
++                        match batch {
++                            PrimitiveBatch::Meshes(_) => {
++                                next += 1;
++                                end = next;
++                            }
++                            PrimitiveBatch::MonochromeSprites { .. }
++                            | PrimitiveBatch::PolychromeSprites { .. } => next += 1,
++                            _ => break,
++                        }
++                    }
++                    next = end;
++                    command_encoder.end_encoding();
++
++                    let drawn_bounds = self.draw_mesh_run_to_intermediate(
++                        scene,
++                        &batches[start..end],
++                        instance_bindings,
++                        writer,
++                        viewport_size,
++                        command_buffer,
++                    )?;
++
++                    command_encoder = new_command_encoder_for_texture(
++                        command_buffer,
++                        texture,
++                        viewport_size,
++                        None,
++                    );
++
++                    if let Some(bounds) = drawn_bounds
++                        && let Err(error) = self.composite_intermediate(
++                            &[PathSprite { bounds }],
++                            writer,
++                            viewport_size,
++                            command_encoder,
++                        )
++                    {
++                        command_encoder.end_encoding();
++                        return Err(error);
++                    }
++                }
+                 PrimitiveBatch::Underlines(range) => {
+                     self.draw_underlines(range, instance_bindings, viewport_size, command_encoder)
+                 }
+@@ -975,6 +1100,260 @@ impl MetalRenderer {
+         Ok(())
+     }
+ 
++    /// Rasterizes a run of batches that starts and ends with meshes (and may hold sprites
++    /// painted between them) into the path intermediate texture, multisampled like paths, in
++    /// order: each batch of meshes is one instanced draw call, an instance per mesh block.
++    /// Returns the bounds to composite, if anything was drawn.
++    fn draw_mesh_run_to_intermediate(
++        &self,
++        scene: &Scene,
++        run: &[PrimitiveBatch],
++        instance_bindings: &InstanceBindings,
++        writer: &mut InstanceBufferWriter,
++        viewport_size: Size<DevicePixels>,
++        command_buffer: &metal::CommandBufferRef,
++    ) -> Result<Option<Bounds<ScaledPixels>>> {
++        let pages: Vec<metal::Buffer> = self.mesh_store.pages().cloned().collect();
++        if pages.is_empty() {
++            return Ok(None);
++        }
++        let intermediate_texture = self
++            .path_intermediate_texture
++            .as_ref()
++            .context("missing path intermediate texture")?;
++
++        let render_pass_descriptor = metal::RenderPassDescriptor::new();
++        let color_attachment = render_pass_descriptor
++            .color_attachments()
++            .object_at(0)
++            .context("no color attachment")?;
++        color_attachment.set_load_action(metal::MTLLoadAction::Clear);
++        color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
++        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
++            color_attachment.set_texture(Some(msaa_texture));
++            color_attachment.set_resolve_texture(Some(intermediate_texture));
++            color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
++        } else {
++            color_attachment.set_texture(Some(intermediate_texture));
++            color_attachment.set_store_action(metal::MTLStoreAction::Store);
++        }
++        let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
++        command_encoder.set_viewport(metal::MTLViewport {
++            originX: 0.0,
++            originY: 0.0,
++            width: i32::from(viewport_size.width) as f64,
++            height: i32::from(viewport_size.height) as f64,
++            znear: 0.0,
++            zfar: 1.0,
++        });
++
++        let mut union: Option<Bounds<ScaledPixels>> = None;
++        let mut add = |bounds: Bounds<ScaledPixels>| {
++            union = Some(match union {
++                Some(union) => union.union(&bounds),
++                None => bounds,
++            });
++        };
++        let result = (|| -> Result<()> {
++            for batch in run {
++                match batch {
++                    PrimitiveBatch::Meshes(range) => {
++                        if let Some(bounds) = self.encode_meshes(
++                            &scene.meshes[range.clone()],
++                            &pages,
++                            writer,
++                            viewport_size,
++                            command_encoder,
++                        )? {
++                            add(bounds);
++                        }
++                    }
++                    PrimitiveBatch::MonochromeSprites { texture_id, range } => {
++                        for sprite in &scene.monochrome_sprites[range.clone()] {
++                            add(sprite_bounds(
++                                sprite.bounds,
++                                sprite.transformation,
++                                &sprite.content_mask,
++                            ));
++                        }
++                        self.draw_sprites_with(
++                            &self.intermediate_monochrome_sprites_pipeline_state,
++                            &instance_bindings.monochrome_sprites,
++                            *texture_id,
++                            range.clone(),
++                            viewport_size,
++                            command_encoder,
++                        );
++                    }
++                    PrimitiveBatch::PolychromeSprites { texture_id, range } => {
++                        for sprite in &scene.polychrome_sprites[range.clone()] {
++                            add(sprite_bounds(
++                                sprite.bounds,
++                                sprite.transformation,
++                                &sprite.content_mask,
++                            ));
++                        }
++                        self.draw_sprites_with(
++                            &self.intermediate_polychrome_sprites_pipeline_state,
++                            &instance_bindings.polychrome_sprites,
++                            *texture_id,
++                            range.clone(),
++                            viewport_size,
++                            command_encoder,
++                        );
++                    }
++                    _ => {}
++                }
++            }
++            Ok(())
++        })();
++        command_encoder.end_encoding();
++        result?;
++        Ok(union.filter(|bounds| !bounds.is_empty()))
++    }
++
++    /// Encodes a batch of meshes as one instanced draw call on `command_encoder` (a pass into
++    /// the path intermediate texture). Returns the bounds it may paint.
++    fn encode_meshes(
++        &self,
++        meshes: &[MeshDraw],
++        pages: &[metal::Buffer],
++        writer: &mut InstanceBufferWriter,
++        viewport_size: Size<DevicePixels>,
++        command_encoder: &metal::RenderCommandEncoderRef,
++    ) -> Result<Option<Bounds<ScaledPixels>>> {
++        let mut draws = Vec::with_capacity(meshes.len());
++        let mut chunks = Vec::new();
++        let mut union: Option<Bounds<ScaledPixels>> = None;
++        for draw in meshes {
++            let clip_bounds = draw.clipped_bounds();
++            if clip_bounds.is_empty() {
++                continue;
++            }
++            let Some(blocks) = self.mesh_store.blocks(draw.mesh.id()) else {
++                continue;
++            };
++            let index = draws.len() as u32;
++            draws.push(MeshDrawInstance {
++                transformation: draw.transformation,
++                background: draw.background,
++                // (a gradient spans the clipped bounds, as for paths on every
++                // backend and for meshes drawn through the path pipelines)
++                bounds: clip_bounds,
++                clip_bounds,
++                first_chunk: chunks.len() as u32,
++                vertex_count: draw.mesh.len() as u32,
++            });
++            chunks.extend(blocks.iter().map(|block| MeshChunk {
++                draw: index,
++                page: block.page,
++                first_vertex: block.first_vertex,
++            }));
++            union = Some(match union {
++                Some(bounds) => bounds.union(&clip_bounds),
++                None => clip_bounds,
++            });
++        }
++        if chunks.is_empty() {
++            return Ok(None);
++        }
++        let draw_bindings = writer.write(&draws)?;
++        let chunk_bindings = writer.write(&chunks)?;
++
++        command_encoder.set_render_pipeline_state(&self.meshes_rasterization_pipeline_state);
++        // (slots past the last page hold the first: the shader reads only real pages)
++        let slots = [
++            MeshInputIndex::Page0,
++            MeshInputIndex::Page1,
++            MeshInputIndex::Page2,
++            MeshInputIndex::Page3,
++            MeshInputIndex::Page4,
++            MeshInputIndex::Page5,
++            MeshInputIndex::Page6,
++            MeshInputIndex::Page7,
++        ];
++        for (index, slot) in slots.into_iter().enumerate().take(MAX_PAGES) {
++            let page = pages.get(index).unwrap_or(&pages[0]);
++            command_encoder.set_vertex_buffer(slot as u64, Some(page), 0);
++        }
++        command_encoder.set_vertex_buffer(
++            MeshInputIndex::Draws as u64,
++            Some(&draw_bindings.buffer),
++            draw_bindings.offset as u64,
++        );
++        command_encoder.set_vertex_buffer(
++            MeshInputIndex::Chunks as u64,
++            Some(&chunk_bindings.buffer),
++            chunk_bindings.offset as u64,
++        );
++        command_encoder.set_vertex_bytes(
++            MeshInputIndex::ViewportSize as u64,
++            mem::size_of_val(&viewport_size) as u64,
++            &viewport_size as *const Size<DevicePixels> as *const _,
++        );
++        let block_vertices = MESH_BLOCK_VERTICES;
++        command_encoder.set_vertex_bytes(
++            MeshInputIndex::BlockVertices as u64,
++            mem::size_of_val(&block_vertices) as u64,
++            &block_vertices as *const u32 as *const _,
++        );
++        command_encoder.set_fragment_buffer(
++            MeshInputIndex::Draws as u64,
++            Some(&draw_bindings.buffer),
++            draw_bindings.offset as u64,
++        );
++        command_encoder.draw_primitives_instanced(
++            metal::MTLPrimitiveType::Triangle,
++            0,
++            u64::from(MESH_BLOCK_VERTICES),
++            chunks.len() as u64,
++        );
++        Ok(union)
++    }
++
++    /// Composites the path intermediate texture within `sprites` onto the target.
++    fn composite_intermediate(
++        &self,
++        sprites: &[PathSprite],
++        writer: &mut InstanceBufferWriter,
++        viewport_size: Size<DevicePixels>,
++        command_encoder: &metal::RenderCommandEncoderRef,
++    ) -> Result<()> {
++        let intermediate_texture = self
++            .path_intermediate_texture
++            .as_ref()
++            .context("missing path intermediate texture")?;
++
++        command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
++        command_encoder.set_vertex_buffer(
++            SpriteInputIndex::Vertices as u64,
++            Some(&self.unit_vertices),
++            0,
++        );
++        command_encoder.set_vertex_bytes(
++            SpriteInputIndex::ViewportSize as u64,
++            mem::size_of_val(&viewport_size) as u64,
++            &viewport_size as *const Size<DevicePixels> as *const _,
++        );
++        command_encoder.set_fragment_texture(
++            SpriteInputIndex::AtlasTexture as u64,
++            Some(intermediate_texture),
++        );
++        let sprite_instance_bindings = writer.write(sprites)?;
++        command_encoder.set_vertex_buffer(
++            SpriteInputIndex::Sprites as u64,
++            Some(&sprite_instance_bindings.buffer),
++            sprite_instance_bindings.offset as u64,
++        );
++        command_encoder.draw_primitives_instanced(
++            metal::MTLPrimitiveType::Triangle,
++            0,
++            6,
++            sprites.len() as u64,
++        );
++        Ok(())
++    }
++
+     fn draw_underlines(
+         &self,
+         underlines: Range<usize>,
+@@ -1024,6 +1403,27 @@ impl MetalRenderer {
+         instance_bindings: &InstanceBindings,
+         viewport_size: Size<DevicePixels>,
+         command_encoder: &metal::RenderCommandEncoderRef,
++    ) {
++        self.draw_sprites_with(
++            &self.monochrome_sprites_pipeline_state,
++            &instance_bindings.monochrome_sprites,
++            texture_id,
++            sprites,
++            viewport_size,
++            command_encoder,
++        );
++    }
++
++    /// Draws a range of sprites (monochrome or polychrome, as `pipeline_state` and `binding`
++    /// say) from one atlas texture.
++    fn draw_sprites_with(
++        &self,
++        pipeline_state: &metal::RenderPipelineState,
++        binding: &InstanceBinding,
++        texture_id: AtlasTextureId,
++        sprites: Range<usize>,
++        viewport_size: Size<DevicePixels>,
++        command_encoder: &metal::RenderCommandEncoderRef,
+     ) {
+         if sprites.is_empty() {
+             return;
+@@ -1036,7 +1436,7 @@ impl MetalRenderer {
+             DevicePixels(texture.width() as i32),
+             DevicePixels(texture.height() as i32),
+         );
+-        command_encoder.set_render_pipeline_state(&self.monochrome_sprites_pipeline_state);
++        command_encoder.set_render_pipeline_state(pipeline_state);
+         command_encoder.set_vertex_buffer(
+             SpriteInputIndex::Vertices as u64,
+             Some(&self.unit_vertices),
+@@ -1044,8 +1444,8 @@ impl MetalRenderer {
+         );
+         command_encoder.set_vertex_buffer(
+             SpriteInputIndex::Sprites as u64,
+-            Some(&instance_bindings.monochrome_sprites.buffer),
+-            instance_bindings.monochrome_sprites.offset as u64,
++            Some(&binding.buffer),
++            binding.offset as u64,
+         );
+         command_encoder.set_vertex_bytes(
+             SpriteInputIndex::ViewportSize as u64,
+@@ -1059,8 +1459,8 @@ impl MetalRenderer {
+         );
+         command_encoder.set_fragment_buffer(
+             SpriteInputIndex::Sprites as u64,
+-            Some(&instance_bindings.monochrome_sprites.buffer),
+-            instance_bindings.monochrome_sprites.offset as u64,
++            Some(&binding.buffer),
++            binding.offset as u64,
+         );
+         command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
+ 
+@@ -1081,51 +1481,13 @@ impl MetalRenderer {
+         viewport_size: Size<DevicePixels>,
+         command_encoder: &metal::RenderCommandEncoderRef,
+     ) {
+-        if sprites.is_empty() {
+-            return;
+-        }
+-
+-        let Some(texture) = self.sprite_atlas.metal_texture(texture_id) else {
+-            return;
+-        };
+-        let texture_size = size(
+-            DevicePixels(texture.width() as i32),
+-            DevicePixels(texture.height() as i32),
+-        );
+-        command_encoder.set_render_pipeline_state(&self.polychrome_sprites_pipeline_state);
+-        command_encoder.set_vertex_buffer(
+-            SpriteInputIndex::Vertices as u64,
+-            Some(&self.unit_vertices),
+-            0,
+-        );
+-        command_encoder.set_vertex_buffer(
+-            SpriteInputIndex::Sprites as u64,
+-            Some(&instance_bindings.polychrome_sprites.buffer),
+-            instance_bindings.polychrome_sprites.offset as u64,
+-        );
+-        command_encoder.set_vertex_bytes(
+-            SpriteInputIndex::ViewportSize as u64,
+-            mem::size_of_val(&viewport_size) as u64,
+-            &viewport_size as *const Size<DevicePixels> as *const _,
+-        );
+-        command_encoder.set_vertex_bytes(
+-            SpriteInputIndex::AtlasTextureSize as u64,
+-            mem::size_of_val(&texture_size) as u64,
+-            &texture_size as *const Size<DevicePixels> as *const _,
+-        );
+-        command_encoder.set_fragment_buffer(
+-            SpriteInputIndex::Sprites as u64,
+-            Some(&instance_bindings.polychrome_sprites.buffer),
+-            instance_bindings.polychrome_sprites.offset as u64,
+-        );
+-        command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
+-
+-        command_encoder.draw_primitives_instanced_base_instance(
+-            metal::MTLPrimitiveType::Triangle,
+-            0,
+-            6,
+-            sprites.len() as u64,
+-            sprites.start as u64,
++        self.draw_sprites_with(
++            &self.polychrome_sprites_pipeline_state,
++            &instance_bindings.polychrome_sprites,
++            texture_id,
++            sprites,
++            viewport_size,
++            command_encoder,
+         );
+     }
+ 
+@@ -1314,6 +1676,62 @@ fn build_pipeline_state(
+         .expect("could not create render pipeline state")
+ }
+ 
++/// A sprite pipeline that rasterizes into the multisampled path texture, which holds
++/// premultiplied colours (the sprite shaders output straight ones).
++fn build_intermediate_sprite_pipeline_state(
++    device: &metal::DeviceRef,
++    library: &metal::LibraryRef,
++    label: &str,
++    vertex_fn_name: &str,
++    fragment_fn_name: &str,
++    path_sample_count: u32,
++) -> metal::RenderPipelineState {
++    let vertex_fn = library
++        .get_function(vertex_fn_name, None)
++        .expect("error locating vertex function");
++    let fragment_fn = library
++        .get_function(fragment_fn_name, None)
++        .expect("error locating fragment function");
++
++    let descriptor = metal::RenderPipelineDescriptor::new();
++    descriptor.set_label(label);
++    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
++    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
++    if path_sample_count > 1 {
++        descriptor.set_raster_sample_count(path_sample_count as _);
++        descriptor.set_alpha_to_coverage_enabled(false);
++    }
++    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
++    color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
++    color_attachment.set_blending_enabled(true);
++    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
++    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
++    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
++    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
++    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
++    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
++
++    device
++        .new_render_pipeline_state(&descriptor)
++        .expect("could not create render pipeline state")
++}
++
++/// The area a sprite paints (its transformed bounds within its clip).
++fn sprite_bounds(
++    bounds: Bounds<ScaledPixels>,
++    transformation: TransformationMatrix,
++    content_mask: &ContentMask<ScaledPixels>,
++) -> Bounds<ScaledPixels> {
++    let painted = if transformation == TransformationMatrix::unit() {
++        bounds
++    } else {
++        transformation
++            .transform_bounds(bounds)
++            .dilate(ScaledPixels(1.))
++    };
++    painted.intersect(&content_mask.bounds)
++}
++
+ fn build_path_sprite_pipeline_state(
+     device: &metal::DeviceRef,
+     library: &metal::LibraryRef,
+@@ -1593,6 +2011,23 @@ enum PathRasterizationInputIndex {
+     ViewportSize = 1,
+ }
+ 
++#[repr(C)]
++enum MeshInputIndex {
++    Draws = 0,
++    Chunks = 1,
++    ViewportSize = 2,
++    BlockVertices = 3,
++    /// The vertex pages (`MAX_PAGES` slots from here).
++    Page0 = 4,
++    Page1 = 5,
++    Page2 = 6,
++    Page3 = 7,
++    Page4 = 8,
++    Page5 = 9,
++    Page6 = 10,
++    Page7 = 11,
++}
++
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ #[repr(C)]
+ pub struct PathSprite {
+@@ -1638,3 +2073,288 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
+         self.renderer.sprite_atlas().clone()
+     }
+ }
++
++#[cfg(test)]
++mod mesh_tests {
++    use super::*;
++    use gpui::{
++        ContentMask, Hsla, Mesh, MeshVertex, Pixels, Rgba, TransformationMatrix, hatch_pattern, px,
++    };
++
++    const SIZE: i32 = 160;
++
++    fn renderer() -> Option<MetalRenderer> {
++        metal::Device::system_default()?;
++        Some(MetalRenderer::new_headless(Arc::new(Mutex::new(
++            InstanceBufferPool::default(),
++        ))))
++    }
++
++    fn render(renderer: &mut MetalRenderer, scene: &mut Scene) -> image::RgbaImage {
++        scene.finish();
++        renderer
++            .render_scene_to_image(scene, size(DevicePixels(SIZE), DevicePixels(SIZE)))
++            .expect("rendering should succeed")
++    }
++
++    fn rgba(r: f32, g: f32, b: f32, a: f32) -> Rgba {
++        Rgba { r, g, b, a }
++    }
++
++    fn whole_viewport() -> ContentMask<ScaledPixels> {
++        ContentMask {
++            bounds: Bounds {
++                origin: point(ScaledPixels(0.), ScaledPixels(0.)),
++                size: size(ScaledPixels(SIZE as f32), ScaledPixels(SIZE as f32)),
++            },
++        }
++    }
++
++    /// Triangles (mesh space) and their colours: a star over a translucent square, both
++    /// crossing each other.
++    fn shapes() -> Vec<([Point<f32>; 3], Rgba)> {
++        let mut triangles = Vec::new();
++        let square = rgba(0.2, 0.4, 0.9, 0.6);
++        triangles.push((
++            [point(-30., -30.), point(30., -30.), point(30., 30.)],
++            square,
++        ));
++        triangles.push((
++            [point(-30., -30.), point(30., 30.), point(-30., 30.)],
++            square,
++        ));
++        let star = rgba(0.9, 0.3, 0.1, 0.8);
++        for i in 0..5 {
++            let angle = |k: f32| (k * 0.4 - 0.5) * std::f32::consts::PI;
++            let tip = point(
++                45. * angle(i as f32 * 2.).cos(),
++                45. * angle(i as f32 * 2.).sin(),
++            );
++            let left = point(
++                18. * angle(i as f32 * 2. - 1.).cos(),
++                18. * angle(i as f32 * 2. - 1.).sin(),
++            );
++            let right = point(
++                18. * angle(i as f32 * 2. + 1.).cos(),
++                18. * angle(i as f32 * 2. + 1.).sin(),
++            );
++            triangles.push(([left, tip, right], star));
++            triangles.push(([left, right, point(0., 0.)], star));
++        }
++        triangles
++    }
++
++    fn mesh() -> Mesh {
++        Mesh::new(
++            shapes()
++                .into_iter()
++                .flat_map(|(points, color)| points.map(|point| MeshVertex::new(point, color))),
++        )
++    }
++
++    /// Mesh space → scaled pixels: turned, scaled and moved.
++    fn transformation() -> TransformationMatrix {
++        let (sin, cos) = 0.3f32.sin_cos();
++        TransformationMatrix {
++            rotation_scale: [[1.3 * cos, -1.3 * sin], [1.3 * sin, 1.3 * cos]],
++            translation: [80.5, 77.25],
++        }
++    }
++
++    /// The same triangles as paths, transformed on the CPU: one path per colour run, in order.
++    fn insert_paths(scene: &mut Scene, paint: impl Fn(Rgba) -> Background) {
++        let t = transformation();
++        let mut current: Option<(Rgba, Path<Pixels>)> = None;
++        let flush = |scene: &mut Scene, entry: Option<(Rgba, Path<Pixels>)>| {
++            if let Some((color, mut path)) = entry {
++                path.content_mask = ContentMask {
++                    bounds: Bounds {
++                        origin: point(px(0.), px(0.)),
++                        size: size(px(SIZE as f32), px(SIZE as f32)),
++                    },
++                };
++                path.color = paint(color);
++                scene.insert_primitive(path.scale(1.));
++            }
++        };
++        for (points, color) in shapes() {
++            if current.as_ref().is_some_and(|(c, _)| *c != color) {
++                flush(scene, current.take());
++            }
++            let entry = current.get_or_insert_with(|| (color, Path::new(point(px(0.), px(0.)))));
++            let [a, b, c] = points.map(|p| {
++                let q = t.apply(point(px(p.x), px(p.y)));
++                point(q.x, q.y)
++            });
++            entry
++                .1
++                .push_triangle((a, b, c), (point(0., 1.), point(0., 1.), point(0., 1.)));
++        }
++        flush(scene, current.take());
++    }
++
++    fn insert_mesh(scene: &mut Scene, mesh: &Mesh, background: Background) {
++        let t = transformation();
++        let b = mesh.bounds();
++        let bounds = t
++            .transform_bounds(Bounds {
++                origin: b.origin.map(ScaledPixels),
++                size: b.size.map(ScaledPixels),
++            })
++            .dilate(ScaledPixels(1.));
++        scene.insert_primitive(MeshDraw {
++            order: 0,
++            bounds,
++            content_mask: whole_viewport(),
++            transformation: t,
++            background,
++            mesh: mesh.clone(),
++        });
++    }
++
++    fn max_difference(a: &image::RgbaImage, b: &image::RgbaImage) -> (u8, usize) {
++        let mut max = 0u8;
++        let mut differing = 0;
++        for (p, q) in a.pixels().zip(b.pixels()) {
++            let d =
++                p.0.iter()
++                    .zip(q.0.iter())
++                    .map(|(x, y)| x.abs_diff(*y))
++                    .max()
++                    .unwrap_or(0);
++            max = max.max(d);
++            differing += usize::from(d > 0);
++        }
++        (max, differing)
++    }
++
++    #[test]
++    fn test_meshes_render_like_paths() {
++        let Some(mut renderer) = renderer() else {
++            return;
++        };
++        let mut paths = Scene::default();
++        insert_paths(&mut paths, |color| color.into());
++        let expected = render(&mut renderer, &mut paths);
++
++        let white: Background = Hsla::white().into();
++        let mut meshes = Scene::default();
++        insert_mesh(&mut meshes, &mesh(), white);
++        let actual = render(&mut renderer, &mut meshes);
++        let (max, differing) = max_difference(&expected, &actual);
++        // The GPU transforms the vertices: the last bits of a position may differ from the
++        // CPU's, which may move a multisample in or out of an edge now and then.
++        assert!(
++            max <= 1 || differing <= 3,
++            "{differing} pixels differ, by up to {max}"
++        );
++        assert!(actual.pixels().any(|p| p.0[3] > 0), "the mesh drew nothing");
++    }
++
++    #[test]
++    fn test_mesh_paint_multiplies_vertex_colors() {
++        let Some(mut renderer) = renderer() else {
++            return;
++        };
++        // A half transparent white paint fades the vertex colours.
++        let mut paths = Scene::default();
++        insert_paths(&mut paths, |color| {
++            rgba(color.r, color.g, color.b, color.a * 0.5).into()
++        });
++        let expected = render(&mut renderer, &mut paths);
++        let mut meshes = Scene::default();
++        insert_mesh(&mut meshes, &mesh(), rgba(1., 1., 1., 0.5).into());
++        let actual = render(&mut renderer, &mut meshes);
++        let (max, differing) = max_difference(&expected, &actual);
++        assert!(
++            max <= 1 || differing <= 3,
++            "{differing} pixels differ, by up to {max}"
++        );
++
++        // A pattern is drawn in white vertices as it is.
++        let to_pattern = TransformationMatrix {
++            rotation_scale: [[1. / 16., 0.], [0., 1. / 16.]],
++            translation: [0., 0.],
++        };
++        let hatch = hatch_pattern(rgba(0.9, 0.9, 1., 1.), rgba(0.1, 0.2, 0.8, 1.), to_pattern);
++        let white_mesh = Mesh::new(shapes().into_iter().flat_map(|(points, _)| {
++            points.map(|point| MeshVertex::new(point, rgba(1., 1., 1., 1.)))
++        }));
++        let mut paths = Scene::default();
++        insert_paths(&mut paths, |_| hatch);
++        let expected = render(&mut renderer, &mut paths);
++        let mut meshes = Scene::default();
++        insert_mesh(&mut meshes, &white_mesh, hatch);
++        let actual = render(&mut renderer, &mut meshes);
++        let (max, differing) = max_difference(&expected, &actual);
++        assert!(
++            max <= 1 || differing <= 3,
++            "{differing} pixels differ, by up to {max}"
++        );
++    }
++
++    #[test]
++    fn test_meshes_are_clipped_and_drawn_in_order() {
++        let Some(mut renderer) = renderer() else {
++            return;
++        };
++        let square = |color: Rgba| {
++            Mesh::new(
++                [
++                    point(0., 0.),
++                    point(40., 0.),
++                    point(40., 40.),
++                    point(0., 0.),
++                    point(40., 40.),
++                    point(0., 40.),
++                ]
++                .map(|p| MeshVertex::new(p, color)),
++            )
++        };
++        let red = square(rgba(1., 0., 0., 1.));
++        let blue = square(rgba(0., 0., 1., 0.5));
++        let at = |x: f32, y: f32| TransformationMatrix {
++            rotation_scale: [[1., 0.], [0., 1.]],
++            translation: [x, y],
++        };
++        let draw = |mesh: &Mesh, transformation: TransformationMatrix, clip: f32| MeshDraw {
++            order: 0,
++            bounds: transformation.transform_bounds(Bounds {
++                origin: point(ScaledPixels(0.), ScaledPixels(0.)),
++                size: size(ScaledPixels(40.), ScaledPixels(40.)),
++            }),
++            content_mask: ContentMask {
++                bounds: Bounds {
++                    origin: point(ScaledPixels(0.), ScaledPixels(0.)),
++                    size: size(ScaledPixels(clip), ScaledPixels(SIZE as f32)),
++                },
++            },
++            transformation,
++            background: Hsla::white().into(),
++            mesh: mesh.clone(),
++        };
++        let mut scene = Scene::default();
++        // One layer: every draw gets the same order, so they are one batch.
++        scene.push_layer(whole_viewport().bounds);
++        scene.insert_primitive(draw(&red, at(10., 10.), SIZE as f32));
++        // translucent blue over the red, clipped at x = 40
++        scene.insert_primitive(draw(&blue, at(30., 30.), 40.));
++        // red again, drawn twice from the same mesh
++        scene.insert_primitive(draw(&red, at(100., 100.), SIZE as f32));
++        scene.pop_layer();
++        let image = render(&mut renderer, &mut scene);
++        let pixel = |x: u32, y: u32| image.get_pixel(x, y).0;
++        assert_eq!(pixel(15, 15), [255, 0, 0, 255], "red");
++        // the blue over the red: half blue, half red
++        let over = pixel(35, 35);
++        assert!(
++            over[0].abs_diff(128) <= 1 && over[2].abs_diff(127) <= 1,
++            "{over:?}"
++        );
++        // clipped at x = 40
++        assert_eq!(pixel(45, 45)[2], 0, "clipped");
++        assert_eq!(pixel(120, 120), [255, 0, 0, 255], "the second red");
++        // (the headless target is opaque black)
++        assert_eq!(pixel(80, 80), [0, 0, 0, 255], "nothing between");
++    }
++}
+diff --git a/crates/gpui_apple/src/shaders.metal b/crates/gpui_apple/src/shaders.metal
+index e944a46..b8945ff 100644
+--- a/crates/gpui_apple/src/shaders.metal
++++ b/crates/gpui_apple/src/shaders.metal
+@@ -917,6 +917,115 @@ fragment float4 path_sprite_fragment(
+   return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
+ }
+ 
++struct MeshVertexOutput {
++  float4 position [[position]];
++  float4 color [[flat]];
++  float4 paint_solid [[flat]];
++  float4 paint_color0 [[flat]];
++  float4 paint_color1 [[flat]];
++  uint draw_id [[flat]];
++  float clip_distance [[clip_distance]][4];
++};
++
++struct MeshFragmentInput {
++  float4 position [[position]];
++  float4 color [[flat]];
++  float4 paint_solid [[flat]];
++  float4 paint_color0 [[flat]];
++  float4 paint_color1 [[flat]];
++  uint draw_id [[flat]];
++};
++
++// A batch of meshes is one instanced draw with an instance per block of a draw's mesh
++// (`MeshChunk`), `block_vertices` vertices each, read from the chunk's vertex page. Vertices
++// past the end of a draw's last block collapse to a point, so their triangles are never
++// rasterized.
++vertex MeshVertexOutput mesh_vertex(
++  uint vertex_id [[vertex_id]],
++  uint chunk_id [[instance_id]],
++  device const MeshDrawInstance *draws [[buffer(MeshInputIndex_Draws)]],
++  device const MeshChunk *chunks [[buffer(MeshInputIndex_Chunks)]],
++  constant Size_DevicePixels *viewport_size [[buffer(MeshInputIndex_ViewportSize)]],
++  constant uint *block_vertices [[buffer(MeshInputIndex_BlockVertices)]],
++  device const MeshVertex *page0 [[buffer(MeshInputIndex_Page0)]],
++  device const MeshVertex *page1 [[buffer(MeshInputIndex_Page1)]],
++  device const MeshVertex *page2 [[buffer(MeshInputIndex_Page2)]],
++  device const MeshVertex *page3 [[buffer(MeshInputIndex_Page3)]],
++  device const MeshVertex *page4 [[buffer(MeshInputIndex_Page4)]],
++  device const MeshVertex *page5 [[buffer(MeshInputIndex_Page5)]],
++  device const MeshVertex *page6 [[buffer(MeshInputIndex_Page6)]],
++  device const MeshVertex *page7 [[buffer(MeshInputIndex_Page7)]]
++) {
++  MeshChunk chunk = chunks[chunk_id];
++  MeshDrawInstance draw = draws[chunk.draw];
++  uint index = (chunk_id - draw.first_chunk) * *block_vertices + vertex_id;
++  if (index >= draw.vertex_count) {
++    return MeshVertexOutput{
++      float4(0., 0., 0., 1.), float4(0.), float4(0.), float4(0.), float4(0.), chunk.draw,
++      {-1., -1., -1., -1.}
++    };
++  }
++
++  device const MeshVertex *page;
++  switch (chunk.page) {
++    case 0: page = page0; break;
++    case 1: page = page1; break;
++    case 2: page = page2; break;
++    case 3: page = page3; break;
++    case 4: page = page4; break;
++    case 5: page = page5; break;
++    case 6: page = page6; break;
++    default: page = page7; break;
++  }
++  MeshVertex v = page[chunk.first_vertex + vertex_id];
++  float2 position = transform_point(float2(v.position[0], v.position[1]), draw.transformation);
++  float4 device_position = float4(
++    position * float2(2. / viewport_size->width, -2. / viewport_size->height) + float2(-1., 1.),
++    0.,
++    1.
++  );
++  float4 color = float4(unpack_unorm2x16_to_float(v.rg), unpack_unorm2x16_to_float(v.ba));
++  GradientColor paint = prepare_fill_color(
++    draw.background.tag,
++    draw.background.color_space,
++    draw.background.solid,
++    draw.background.colors[0].color,
++    draw.background.colors[1].color
++  );
++  Bounds_ScaledPixels clip = draw.clip_bounds;
++  return MeshVertexOutput{
++    device_position,
++    color,
++    paint.solid,
++    paint.color0,
++    paint.color1,
++    chunk.draw,
++    {
++      position.x - clip.origin.x,
++      clip.origin.x + clip.size.width - position.x,
++      position.y - clip.origin.y,
++      clip.origin.y + clip.size.height - position.y
++    }
++  };
++}
++
++fragment float4 mesh_fragment(
++  MeshFragmentInput input [[stage_in]],
++  device const MeshDrawInstance *draws [[buffer(MeshInputIndex_Draws)]]
++) {
++  MeshDrawInstance draw = draws[input.draw_id];
++  float4 paint = fill_color(
++    draw.background,
++    input.position.xy,
++    draw.bounds,
++    input.paint_solid,
++    input.paint_color0,
++    input.paint_color1
++  );
++  float4 color = input.color * paint;
++  return float4(color.rgb * color.a, color.a);
++}
++
+ struct SurfaceVertexOutput {
+   float4 position [[position]];
+   float2 texture_position;
+diff --git a/crates/gpui_wgpu/src/shaders_storage.wgsl b/crates/gpui_wgpu/src/shaders_storage.wgsl
+index 55b8080..1892eb0 100644
+--- a/crates/gpui_wgpu/src/shaders_storage.wgsl
++++ b/crates/gpui_wgpu/src/shaders_storage.wgsl
+@@ -40,3 +40,94 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
+ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
+     return b_poly_sprites[instance_id];
+ }
++
++// --- meshes --- //
++//
++// Retained meshes (`Window::paint_mesh`) for a renderer that keeps their vertices in a GPU
++// buffer, as the Metal renderer does: a batch is one instanced draw with an instance per block
++// of a draw's mesh (`MeshChunk`), `MESH_BLOCK_VERTICES` vertices each. (This renderer does not
++// use these entry points yet: it rasterizes meshes through the path pipeline.)
++
++const MESH_BLOCK_VERTICES: u32 = 48u;
++
++struct MeshVertex {
++    position: vec2<f32>,
++    // red and green, blue and alpha, 16 bits each
++    rg: u32,
++    ba: u32,
++}
++
++struct MeshDrawInstance {
++    transformation: TransformationMatrix,
++    background: Background,
++    // what a gradient spans: the clipped bounds, as for paths
++    bounds: Bounds,
++    clip_bounds: Bounds,
++    first_chunk: u32,
++    vertex_count: u32,
++}
++
++struct MeshChunk {
++    draw: u32,
++    // (one vertex buffer here: blocks are addressed by their first vertex in it)
++    page: u32,
++    first_vertex: u32,
++}
++
++@group(1) @binding(0) var<storage, read> b_mesh_draws: array<MeshDrawInstance>;
++@group(1) @binding(1) var<storage, read> b_mesh_chunks: array<MeshChunk>;
++@group(1) @binding(2) var<storage, read> b_mesh_vertices: array<MeshVertex>;
++
++struct MeshVarying {
++    @builtin(position) position: vec4<f32>,
++    @location(0) @interpolate(flat) color: vec4<f32>,
++    @location(1) @interpolate(flat) paint_solid: vec4<f32>,
++    @location(2) @interpolate(flat) paint_color0: vec4<f32>,
++    @location(3) @interpolate(flat) paint_color1: vec4<f32>,
++    @location(4) @interpolate(flat) draw_id: u32,
++    //TODO: use `clip_distance` once Naga supports it
++    @location(5) clip_distances: vec4<f32>,
++}
++
++@vertex
++fn vs_mesh(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) chunk_id: u32) -> MeshVarying {
++    let chunk = b_mesh_chunks[chunk_id];
++    let draw = b_mesh_draws[chunk.draw];
++    var out = MeshVarying();
++    out.draw_id = chunk.draw;
++    let index = (chunk_id - draw.first_chunk) * MESH_BLOCK_VERTICES + vertex_id;
++    if (index >= draw.vertex_count) {
++        // past the end of the draw's last block: a degenerate triangle
++        out.position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
++        out.clip_distances = vec4<f32>(-1.0);
++        return out;
++    }
++    let v = b_mesh_vertices[chunk.first_vertex + vertex_id];
++    let position = transpose(draw.transformation.rotation_scale) * v.position
++        + draw.transformation.translation;
++    out.position = to_device_position_impl(position);
++    out.color = vec4<f32>(unpack2x16unorm(v.rg), unpack2x16unorm(v.ba));
++    let paint = prepare_gradient_color(
++        draw.background.tag,
++        draw.background.color_space,
++        draw.background.solid,
++        draw.background.colors,
++    );
++    out.paint_solid = paint.solid;
++    out.paint_color0 = paint.color0;
++    out.paint_color1 = paint.color1;
++    out.clip_distances = distance_from_clip_rect_impl(position, draw.clip_bounds);
++    return out;
++}
++
++@fragment
++fn fs_mesh(input: MeshVarying) -> @location(0) vec4<f32> {
++    if (any(input.clip_distances < vec4<f32>(0.0))) {
++        return vec4<f32>(0.0);
++    }
++    let draw = b_mesh_draws[input.draw_id];
++    let paint = gradient_color(draw.background, input.position.xy, draw.bounds,
++        input.paint_solid, input.paint_color0, input.paint_color1);
++    let color = input.color * paint;
++    return vec4<f32>(color.rgb * color.a, color.a);
++}
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
+index 81709b1..4925131 100644
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
+ use bytemuck::{Pod, Zeroable};
+ use collections::FxHashMap;
+ use gpui::{
+-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
+-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
++    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MeshDraw, Path, Point,
++    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios, point,
+ };
+ use log::warn;
+ #[cfg(not(target_family = "wasm"))]
+@@ -1502,6 +1502,63 @@ impl WgpuRenderer {
+                             )?;
+                         }
+                     }
++                    PrimitiveBatch::Meshes(range) => {
++                        // Meshes are rasterized through the path pipeline (their vertices
++                        // transformed on the CPU every frame), then composited once.
++                        let meshes = &scene.meshes[range];
++                        let Some(bounds) = meshes
++                            .iter()
++                            .map(MeshDraw::clipped_bounds)
++                            .filter(|bounds| !bounds.is_empty())
++                            .reduce(|a, b| a.union(&b))
++                        else {
++                            continue;
++                        };
++                        let vertices: Vec<PathRasterizationVertex> = meshes
++                            .iter()
++                            .flat_map(|draw| {
++                                let bounds = draw.clipped_bounds();
++                                draw.path_vertices().map(move |(xy_position, color)| {
++                                    PathRasterizationVertex {
++                                        xy_position,
++                                        st_position: point(0., 1.),
++                                        color,
++                                        bounds,
++                                    }
++                                })
++                            })
++                            .collect();
++
++                        drop(pass);
++                        let rasterized = self.rasterize_path_vertices(
++                            &mut encoder,
++                            &vertices,
++                            &mut instance_offset,
++                        )?;
++
++                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                            label: Some("main_pass_continued"),
++                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                                view: frame_view,
++                                resolve_target: None,
++                                ops: wgpu::Operations {
++                                    load: wgpu::LoadOp::Load,
++                                    store: wgpu::StoreOp::Store,
++                                },
++                                depth_slice: None,
++                            })],
++                            depth_stencil_attachment: None,
++                            ..Default::default()
++                        });
++
++                        if rasterized {
++                            self.composite_path_sprites(
++                                &[PathSprite { bounds }],
++                                &mut instance_offset,
++                                &mut pass,
++                            )?;
++                        }
++                    }
+                     PrimitiveBatch::Underlines(range) => self.draw_instances(
+                         &instance_bindings.underlines,
+                         &self.resources().pipelines.underlines,
+@@ -1741,12 +1798,21 @@ impl WgpuRenderer {
+             }
+             vec![PathSprite { bounds }]
+         };
++        self.composite_path_sprites(&sprites, instance_offset, pass)
++    }
+ 
++    /// Composites the path intermediate texture within `sprites` onto the frame.
++    fn composite_path_sprites(
++        &mut self,
++        sprites: &[PathSprite],
++        instance_offset: &mut u64,
++        pass: &mut wgpu::RenderPass<'_>,
++    ) -> Result<()> {
+         let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
+             return Ok(());
+         };
+         let instances =
+-            self.write_instance_binding("path_sprites_bind_group", instance_offset, &sprites)?;
++            self.write_instance_binding("path_sprites_bind_group", instance_offset, sprites)?;
+         let texture = self.create_texture_bind_group(
+             "path_intermediate_texture_bind_group",
+             &path_intermediate_view,
+@@ -1779,7 +1845,16 @@ impl WgpuRenderer {
+                 bounds,
+             }));
+         }
++        self.rasterize_path_vertices(encoder, &vertices, instance_offset)
++    }
+ 
++    /// Rasterizes path triangles into the (multisampled) path intermediate texture.
++    fn rasterize_path_vertices(
++        &mut self,
++        encoder: &mut wgpu::CommandEncoder,
++        vertices: &[PathRasterizationVertex],
++        instance_offset: &mut u64,
++    ) -> Result<bool> {
+         if vertices.is_empty() {
+             return Ok(false);
+         }
+@@ -1787,7 +1862,7 @@ impl WgpuRenderer {
+         let vertex_binding = self.write_instance_binding(
+             "path_rasterization_bind_group",
+             instance_offset,
+-            &vertices,
++            vertices,
+         )?;
+ 
+         let resources = self.resources();
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+index f8b86bc..cf082a1 100644
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -371,9 +371,13 @@ impl DirectXRenderer {
+                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
+                 PrimitiveBatch::Paths(range) => {
+                     let paths = &scene.paths[range];
+-                    self.draw_paths_to_intermediate(paths)?;
+-                    self.draw_paths_from_intermediate(paths)
++                    if self.draw_paths_to_intermediate(paths)? {
++                        self.draw_paths_from_intermediate(paths)
++                    } else {
++                        Ok(())
++                    }
+                 }
++                PrimitiveBatch::Meshes(range) => self.draw_meshes(&scene.meshes[range]),
+                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
+                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                     self.draw_monochrome_sprites(texture_id, range.start, range.len())
+@@ -612,11 +616,28 @@ impl DirectXRenderer {
+         )
+     }
+ 
+-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+-        if paths.is_empty() {
+-            return Ok(());
++    /// Returns whether anything was rasterized (to composite).
++    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<bool> {
++        // Collect all vertices and sprites for a single draw call
++        let mut vertices = Vec::new();
++
++        for path in paths {
++            vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
++                xy_position: v.xy_position,
++                st_position: v.st_position,
++                color: path.color,
++                bounds: path.clipped_bounds(),
++            }));
+         }
++        self.rasterize_path_vertices(&vertices)
++    }
+ 
++    /// Rasterizes path triangles into the multisampled intermediate texture and resolves it.
++    /// Returns whether anything was rasterized.
++    fn rasterize_path_vertices(&mut self, vertices: &[PathRasterizationSprite]) -> Result<bool> {
++        if vertices.is_empty() {
++            return Ok(false);
++        }
+         let devices = self.devices.as_ref().context("devices missing")?;
+         let resources = self.resources.as_ref().context("resources missing")?;
+         // Clear intermediate MSAA texture
+@@ -632,22 +653,10 @@ impl DirectXRenderer {
+             );
+         }
+ 
+-        // Collect all vertices and sprites for a single draw call
+-        let mut vertices = Vec::new();
+-
+-        for path in paths {
+-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
+-                xy_position: v.xy_position,
+-                st_position: v.st_position,
+-                color: path.color,
+-                bounds: path.clipped_bounds(),
+-            }));
+-        }
+-
+         self.pipelines.path_rasterization_pipeline.update_buffer(
+             &devices.device,
+             &devices.device_context,
+-            &vertices,
++            vertices,
+         )?;
+ 
+         self.pipelines.path_rasterization_pipeline.draw(
+@@ -672,7 +681,38 @@ impl DirectXRenderer {
+                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+         }
+ 
+-        Ok(())
++        Ok(true)
++    }
++
++    /// Rasterizes meshes through the path pipeline (their vertices transformed on the CPU every
++    /// frame) and composites them once.
++    fn draw_meshes(&mut self, meshes: &[MeshDraw]) -> Result<()> {
++        let Some(bounds) = meshes
++            .iter()
++            .map(MeshDraw::clipped_bounds)
++            .filter(|bounds| !bounds.is_empty())
++            .reduce(|a, b| a.union(&b))
++        else {
++            return Ok(());
++        };
++        let vertices: Vec<PathRasterizationSprite> = meshes
++            .iter()
++            .flat_map(|draw| {
++                let bounds = draw.clipped_bounds();
++                draw.path_vertices()
++                    .map(move |(xy_position, color)| PathRasterizationSprite {
++                        xy_position,
++                        st_position: point(0., 1.),
++                        color,
++                        bounds,
++                    })
++            })
++            .collect();
++        if self.rasterize_path_vertices(&vertices)? {
++            self.composite_path_sprites(&[PathSprite { bounds }])
++        } else {
++            Ok(())
++        }
+     }
+ 
+     fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+@@ -701,13 +741,17 @@ impl DirectXRenderer {
+             }
+             vec![PathSprite { bounds }]
+         };
++        self.composite_path_sprites(&sprites)
++    }
+ 
++    /// Composites the path intermediate texture within `sprites` onto the render target.
++    fn composite_path_sprites(&mut self, sprites: &[PathSprite]) -> Result<()> {
+         let devices = self.devices.as_ref().context("devices missing")?;
+         let resources = self.resources.as_ref().context("resources missing")?;
+         self.pipelines.path_sprite_pipeline.update_buffer(
+             &devices.device,
+             &devices.device_context,
+-            &sprites,
++            sprites,
+         )?;
+ 
+         // Draw the sprites with the path texture
+diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
+index 24efb17..0a5b14c 100644
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -1415,3 +1415,95 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
+     color.a *= sprite.opacity * saturate(0.5 - distance);
+     return color;
+ }
++
++/*
++**
++**              Meshes
++**
++*/
++
++// Retained meshes (`Window::paint_mesh`) for a renderer that keeps their vertices in a GPU
++// buffer, as the Metal renderer does: a batch is one instanced draw with an instance per block
++// of a draw's mesh (`MeshChunk`), `MESH_BLOCK_VERTICES` vertices each. (This renderer does not
++// use these entry points yet: it rasterizes meshes through the path pipeline.)
++
++static const uint MESH_BLOCK_VERTICES = 48;
++
++struct MeshVertex {
++    float2 position;
++    // red and green, blue and alpha, 16 bits each
++    uint rg;
++    uint ba;
++};
++
++struct MeshDrawInstance {
++    TransformationMatrix transformation;
++    Background background;
++    // what a gradient spans: the clipped bounds, as for paths
++    Bounds bounds;
++    Bounds clip_bounds;
++    uint first_chunk;
++    uint vertex_count;
++};
++
++struct MeshChunk {
++    uint draw;
++    // (one vertex buffer here: blocks are addressed by their first vertex in it)
++    uint page;
++    uint first_vertex;
++};
++
++StructuredBuffer<MeshDrawInstance> mesh_draws: register(t1);
++StructuredBuffer<MeshChunk> mesh_chunks: register(t2);
++StructuredBuffer<MeshVertex> mesh_vertices: register(t3);
++
++struct MeshVertexOutput {
++    float4 position: SV_Position;
++    nointerpolation float4 color: COLOR0;
++    nointerpolation float4 paint_solid: COLOR1;
++    nointerpolation float4 paint_color0: COLOR2;
++    nointerpolation float4 paint_color1: COLOR3;
++    nointerpolation uint draw_id: TEXCOORD0;
++    float4 clip_distance: SV_ClipDistance;
++};
++
++float4 unpack_unorm16(uint rg, uint ba) {
++    return float4(rg & 0xffff, rg >> 16, ba & 0xffff, ba >> 16) / 65535.0;
++}
++
++MeshVertexOutput mesh_vertex(uint vertex_id: SV_VertexID, uint chunk_id: SV_InstanceID) {
++    MeshChunk chunk = mesh_chunks[chunk_id];
++    MeshDrawInstance draw = mesh_draws[chunk.draw];
++    MeshVertexOutput output = (MeshVertexOutput)0;
++    output.draw_id = chunk.draw;
++    uint index = (chunk_id - draw.first_chunk) * MESH_BLOCK_VERTICES + vertex_id;
++    if (index >= draw.vertex_count) {
++        // past the end of the draw's last block: a degenerate triangle
++        output.position = float4(0.0, 0.0, 0.0, 1.0);
++        output.clip_distance = float4(-1.0, -1.0, -1.0, -1.0);
++        return output;
++    }
++    MeshVertex v = mesh_vertices[chunk.first_vertex + vertex_id];
++    float2 position = mul(v.position, draw.transformation.rotation_scale) + draw.transformation.translation;
++    output.position = float4(position / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
++    output.color = unpack_unorm16(v.rg, v.ba);
++    GradientColor paint = prepare_gradient_color(
++        draw.background.tag,
++        draw.background.color_space,
++        draw.background.solid,
++        draw.background.colors
++    );
++    output.paint_solid = paint.solid;
++    output.paint_color0 = paint.color0;
++    output.paint_color1 = paint.color1;
++    output.clip_distance = distance_from_clip_rect_impl(position, draw.clip_bounds);
++    return output;
++}
++
++float4 mesh_fragment(MeshVertexOutput input): SV_Target {
++    MeshDrawInstance draw = mesh_draws[input.draw_id];
++    float4 paint = gradient_color(draw.background, input.position.xy, draw.bounds,
++        input.paint_solid, input.paint_color0, input.paint_color1);
++    float4 color = input.color * paint;
++    return float4(color.rgb * color.a, color.a);
++}

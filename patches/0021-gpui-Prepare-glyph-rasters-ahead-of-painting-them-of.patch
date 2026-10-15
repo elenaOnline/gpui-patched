@@ -1,0 +1,703 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 06:58:34 -0700
+Subject: [PATCH] gpui: Prepare glyph rasters ahead of painting them, off the
+ main thread
+
+Painting a glyph the sprite atlas does not have rasterizes it on the main
+thread: the platform draws it into a bitmap (on macOS Core Text, and for a
+font at a new size a font registry query first). Text that keeps changing
+size, such as a canvas's while it zooms, reaches new sizes every frame, and
+a text-heavy canvas spent most of such a frame rasterizing.
+
+`TextSystem::prepare_glyphs` rasterizes glyphs on the calling thread (a
+background one) and keeps copies of the rasters; painting a glyph with the
+same parameters takes its prepared raster instead of rasterizing (once).
+The copies live in 1 MB chunks mapped from the system (allocated on other
+platforms), 16 MB at most: a new chunk past that takes the place of the
+oldest, whose rasters are dropped, and `TextSystem::release_prepared_glyphs`
+drops them all and unmaps the chunks, so the memory leaves the process at
+once (an allocator may keep what one thread frees of another's, and return
+it to the system lazily; the rasterizing thread frees its own bitmaps). A
+glyph painting rasterized itself while glyphs were being prepared (not
+prepared in time) is not prepared again, or kept, until the release. A
+glyph prepared twice at once (two threads) keeps one raster. A glyph whose
+raster would take more than 256 KB is not prepared: painting rasterizes it
+as before. `TextSystem::prepared_glyph_stats` counts what became of the
+prepared rasters (prepared, taken, dropped, rasterized too late, not kept
+for want of memory, and their bytes), for callers that adapt how much they
+ask for.
+
+`TextSystem::rasterize_glyph` (what painting calls) is public, and
+`Window::glyph_render_params` gives the parameters
+`paint_glyph_transformed` would rasterize a glyph with now (the subpixel
+variant, the dilation for the colour, the font smoothing), so a caller can
+ask for exactly the rasters its next frames will paint;
+`Window::has_glyph_raster` tells whether the sprite atlas has a glyph
+(`PlatformAtlas::contains`, now outside test support; the Metal, wgpu
+and DirectX atlases answer it), so a caller does not ask for those. Nothing changes for
+callers that do not prepare glyphs: the same raster comes out either way.
+
+`TextSystem::raster_bounds` no longer holds its cache's upgradable lock
+while it measures a glyph, so glyphs measured on other threads do not hold
+up the ones painted meanwhile.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/Cargo.toml                   |   3 +
+ crates/gpui/src/platform.rs              |   4 +-
+ crates/gpui/src/text_system.rs           | 395 ++++++++++++++++++++++-
+ crates/gpui/src/window.rs                | 114 +++++--
+ crates/gpui_apple/src/metal_atlas.rs     |   4 +
+ crates/gpui_wgpu/src/wgpu_atlas.rs       |   4 +
+ crates/gpui_windows/src/directx_atlas.rs |   4 +
+ 7 files changed, 480 insertions(+), 48 deletions(-)
+
+diff --git a/crates/gpui/Cargo.toml b/crates/gpui/Cargo.toml
+index e767de5..3b1ede3 100644
+--- a/crates/gpui/Cargo.toml
++++ b/crates/gpui/Cargo.toml
+@@ -117,6 +117,9 @@ getrandom = { version = "0.3.4", features = ["wasm_js"] }
+ uuid = { workspace = true, features = ["js"] }
+ 
+ 
++[target.'cfg(unix)'.dependencies]
++libc.workspace = true
++
+ [target.'cfg(target_os = "macos")'.dependencies]
+ core-video.workspace = true
+ objc2-core-foundation.workspace = true
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 06d5687..342ff05 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1478,7 +1478,8 @@ pub trait PlatformAtlas {
+         Vec::new()
+     }
+ 
+-    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
++    /// Whether the atlas has a tile for `key` (atlases that do not tell
++    /// say no).
+     fn contains(&self, _key: &AtlasKey) -> bool {
+         false
+     }
+@@ -1730,7 +1731,6 @@ impl PlatformAtlas for HeadlessAtlas {
+         self.0.lock().remove(key);
+     }
+ 
+-    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+     fn contains(&self, key: &AtlasKey) -> bool {
+         self.0.lock().contains(key)
+     }
+diff --git a/crates/gpui/src/text_system.rs b/crates/gpui/src/text_system.rs
+index b9f3ae5..3a09bb3 100644
+--- a/crates/gpui/src/text_system.rs
++++ b/crates/gpui/src/text_system.rs
+@@ -226,12 +226,309 @@ impl Drop for MissingGlyphReceiver {
+     }
+ }
+ 
++/// The most bytes of glyph rasters [`TextSystem::prepare_glyphs`] keeps
++/// (that no painting has taken yet), in 1 MB chunks mapped from the
++/// system: released, they leave the process at once (an
++/// allocator may keep memory freed by another thread than the one that
++/// allocated it, and returns it to the system lazily).
++pub const MAX_PREPARED_GLYPH_BYTES: usize = 16 << 20;
++
++/// Prepared rasters are copied into chunks of this many bytes; a new chunk
++/// that would pass [`MAX_PREPARED_GLYPH_BYTES`] takes the place of the
++/// oldest, whose rasters are dropped.
++const PREPARED_CHUNK_BYTES: usize = 1 << 20;
++
++/// What became of the rasters [`TextSystem::prepare_glyphs`] kept, since the
++/// text system was made: a caller that prepares more than is painted can
++/// tell, and ask for less.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct PreparedGlyphStats {
++    /// Rasters prepared and kept.
++    pub prepared: u64,
++    /// Their bytes.
++    pub prepared_bytes: u64,
++    /// Taken by painting.
++    pub taken: u64,
++    /// Their bytes.
++    pub taken_bytes: u64,
++    /// Dropped unused: the oldest beyond [`MAX_PREPARED_GLYPH_BYTES`], or
++    /// released ([`TextSystem::release_prepared_glyphs`]).
++    pub dropped: u64,
++    /// Rasterized too late: painting had rasterized the glyph itself.
++    pub late: u64,
++    /// Rasterized but not kept: no memory could be mapped for it.
++    pub failed: u64,
++}
++
++/// A glyph whose raster would take more than this is not prepared (painting
++/// it rasterizes it as before): no single glyph takes much of
++/// [`MAX_PREPARED_GLYPH_BYTES`], or of the memory preparing it needs.
++pub const MAX_PREPARED_GLYPH_RASTER_BYTES: usize = PREPARED_CHUNK_BYTES / 4;
++
++/// At most this many glyphs painting rasterized itself while glyphs were
++/// being prepared are remembered (not prepared again): past it, the oldest
++/// half is forgotten.
++const MAX_PAINTED_GLYPHS: usize = 16384;
++
++/// A prepared raster: its size, and where its bytes are.
++struct PreparedRaster {
++    size: Size<DevicePixels>,
++    chunk: u64,
++    offset: usize,
++    len: usize,
++}
++
++/// Memory prepared rasters are copied into, one after the other: mapped
++/// from the system on unix (and unmapped when dropped), allocated
++/// elsewhere.
++struct PreparedChunk {
++    ptr: std::ptr::NonNull<u8>,
++    /// Bytes written, from the start.
++    used: usize,
++    /// Rasters in it that were neither taken nor dropped.
++    live: usize,
++    /// Chunks are numbered in the order they are started.
++    id: u64,
++}
++
++// SAFETY: a chunk owns its memory, reached only through `&self`/`&mut self`
++// (the text system's lock).
++unsafe impl Send for PreparedChunk {}
++
++impl PreparedChunk {
++    fn new(id: u64) -> Option<Self> {
++        #[cfg(unix)]
++        // SAFETY: a new anonymous private mapping; no other precondition
++        let ptr = unsafe {
++            let ptr = libc::mmap(
++                std::ptr::null_mut(),
++                PREPARED_CHUNK_BYTES,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_PRIVATE | libc::MAP_ANON,
++                -1,
++                0,
++            );
++            if ptr == libc::MAP_FAILED {
++                return None;
++            }
++            ptr.cast::<u8>()
++        };
++        #[cfg(not(unix))]
++        let ptr = Box::into_raw(vec![0u8; PREPARED_CHUNK_BYTES].into_boxed_slice()).cast::<u8>();
++        std::ptr::NonNull::new(ptr).map(|ptr| Self {
++            ptr,
++            used: 0,
++            live: 0,
++            id,
++        })
++    }
++
++    /// Copies `bytes` in after the others: their offset, or `None` when they
++    /// do not fit.
++    fn push(&mut self, bytes: &[u8]) -> Option<usize> {
++        let offset = self.used;
++        if bytes.len() > PREPARED_CHUNK_BYTES - offset {
++            return None;
++        }
++        // SAFETY: within the chunk (checked above), which nothing borrows
++        // (`&mut self`); `bytes` is not in it (only `bytes` borrows it)
++        unsafe {
++            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(offset), bytes.len())
++        };
++        self.used += bytes.len();
++        self.live += 1;
++        Some(offset)
++    }
++
++    fn bytes(&self, offset: usize, len: usize) -> &[u8] {
++        assert!(offset + len <= self.used, "a prepared raster outside its chunk");
++        // SAFETY: bytes written by `push` (checked above), in the chunk for
++        // as long as `&self`
++        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) }
++    }
++
++    /// The chunk emptied, for new rasters.
++    fn reuse(&mut self, id: u64) {
++        self.used = 0;
++        self.live = 0;
++        self.id = id;
++    }
++}
++
++impl Drop for PreparedChunk {
++    fn drop(&mut self) {
++        #[cfg(unix)]
++        // SAFETY: the mapping `new` made, unmapped once
++        unsafe {
++            libc::munmap(self.ptr.as_ptr().cast(), PREPARED_CHUNK_BYTES);
++        }
++        #[cfg(not(unix))]
++        // SAFETY: the box `new` leaked, freed once
++        unsafe {
++            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
++                self.ptr.as_ptr(),
++                PREPARED_CHUNK_BYTES,
++            )));
++        }
++    }
++}
++
++/// Glyph rasters prepared ahead of painting (see
++/// [`TextSystem::prepare_glyphs`]), in chunks oldest first (rasters are
++/// copied into the last), and the glyphs painting rasterized itself
++/// meanwhile.
++#[derive(Default)]
++struct PreparedGlyphs {
++    rasters: FxHashMap<RenderGlyphParams, PreparedRaster>,
++    chunks: VecDeque<PreparedChunk>,
++    next_chunk: u64,
++    painted: FxHashSet<RenderGlyphParams>,
++    painted_order: VecDeque<RenderGlyphParams>,
++    stats: PreparedGlyphStats,
++}
++
++impl PreparedGlyphs {
++    /// Whether the glyph is prepared, or painting rasterized it while
++    /// glyphs were being prepared (preparing it would be too late).
++    fn contains(&self, params: &RenderGlyphParams) -> bool {
++        self.rasters.contains_key(params) || self.painted.contains(params)
++    }
++
++    /// Keeps a copy of a raster (replacing the glyph's, when two threads
++    /// prepared it at once), unless painting rasterized the glyph
++    /// meanwhile. Returns the glyphs dropped unused to keep within
++    /// [`MAX_PREPARED_GLYPH_BYTES`].
++    fn insert(
++        &mut self,
++        params: RenderGlyphParams,
++        size: Size<DevicePixels>,
++        bytes: &[u8],
++    ) -> Vec<RenderGlyphParams> {
++        let mut dropped = Vec::new();
++        if self.painted.contains(&params) {
++            self.stats.late += 1;
++            return dropped;
++        }
++        if bytes.len() > MAX_PREPARED_GLYPH_RASTER_BYTES {
++            return dropped;
++        }
++        if let Some((replaced, _)) = self.remove(&params) {
++            self.stats.prepared -= 1;
++            self.stats.prepared_bytes -= replaced.len as u64;
++        }
++        let pushed = self.chunks.back_mut().and_then(|chunk| chunk.push(bytes));
++        let offset = match pushed {
++            Some(offset) => offset,
++            None => {
++                let pushed = if self.start_chunk(&mut dropped) {
++                    self.chunks.back_mut().and_then(|chunk| chunk.push(bytes))
++                } else {
++                    None
++                };
++                let Some(offset) = pushed else {
++                    self.stats.failed += 1;
++                    return dropped;
++                };
++                offset
++            }
++        };
++        let chunk = self.chunks.back().map_or(0, |chunk| chunk.id);
++        self.rasters.insert(
++            params,
++            PreparedRaster {
++                size,
++                chunk,
++                offset,
++                len: bytes.len(),
++            },
++        );
++        self.stats.prepared += 1;
++        self.stats.prepared_bytes += bytes.len() as u64;
++        dropped
++    }
++
++    /// Starts a chunk after the others: an emptied one, else a new one
++    /// within [`MAX_PREPARED_GLYPH_BYTES`], else the oldest, its rasters
++    /// dropped (added to `dropped`). Whether there is one.
++    fn start_chunk(&mut self, dropped: &mut Vec<RenderGlyphParams>) -> bool {
++        let id = self.next_chunk;
++        self.next_chunk += 1;
++        let chunk = if let Some(i) = self.chunks.iter().position(|chunk| chunk.live == 0) {
++            self.chunks.remove(i)
++        } else if self.chunks.len() < MAX_PREPARED_GLYPH_BYTES / PREPARED_CHUNK_BYTES {
++            PreparedChunk::new(id)
++        } else {
++            let oldest = self.chunks.pop_front();
++            if let Some(oldest) = &oldest {
++                let before = self.rasters.len();
++                self.rasters.retain(|params, raster| {
++                    let keep = raster.chunk != oldest.id;
++                    if !keep {
++                        dropped.push(params.clone());
++                    }
++                    keep
++                });
++                self.stats.dropped += (before - self.rasters.len()) as u64;
++            }
++            oldest
++        };
++        let Some(mut chunk) = chunk else {
++            return false;
++        };
++        chunk.reuse(id);
++        self.chunks.push_back(chunk);
++        true
++    }
++
++    /// Forgets a glyph's raster: the chunk it is in, if any.
++    fn remove(&mut self, params: &RenderGlyphParams) -> Option<(PreparedRaster, &PreparedChunk)> {
++        let raster = self.rasters.remove(params)?;
++        let chunk = self.chunks.iter_mut().find(|chunk| chunk.id == raster.chunk)?;
++        chunk.live -= 1;
++        Some((raster, chunk))
++    }
++
++    fn take(&mut self, params: &RenderGlyphParams) -> Option<(Size<DevicePixels>, Vec<u8>)> {
++        let (raster, chunk) = self.remove(params)?;
++        let bytes = chunk.bytes(raster.offset, raster.len).to_vec();
++        self.stats.taken += 1;
++        self.stats.taken_bytes += raster.len as u64;
++        Some((raster.size, bytes))
++    }
++
++    /// Painting rasterized a glyph itself: while glyphs are being prepared
++    /// (until the release), it is not prepared, or kept, again.
++    fn painted(&mut self, params: &RenderGlyphParams) {
++        if self.chunks.is_empty() || !self.painted.insert(params.clone()) {
++            return;
++        }
++        self.painted_order.push_back(params.clone());
++        if self.painted_order.len() > MAX_PAINTED_GLYPHS {
++            for old in self.painted_order.drain(..MAX_PAINTED_GLYPHS / 2) {
++                self.painted.remove(&old);
++            }
++        }
++    }
++
++    /// Drops every raster kept, and the memory they and the maps took.
++    /// Returns the glyphs dropped.
++    fn release(&mut self) -> Vec<RenderGlyphParams> {
++        let rasters = std::mem::take(&mut self.rasters);
++        self.stats.dropped += rasters.len() as u64;
++        self.chunks = VecDeque::new();
++        self.painted = FxHashSet::default();
++        self.painted_order = VecDeque::new();
++        rasters.into_keys().collect()
++    }
++}
++
+ /// The GPUI text rendering sub system.
+ pub struct TextSystem {
+     platform_text_system: Arc<dyn PlatformTextSystem>,
+     font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
+     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
+     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
++    prepared_glyphs: Mutex<PreparedGlyphs>,
+     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
+     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
+     fallback_font_stack: SmallVec<[Font; 2]>,
+@@ -249,6 +546,7 @@ impl TextSystem {
+             platform_text_system,
+             font_metrics: RwLock::default(),
+             raster_bounds: RwLock::default(),
++            prepared_glyphs: Mutex::default(),
+             font_ids_by_font: RwLock::default(),
+             wrapper_pool: Mutex::default(),
+             font_runs_pool: Mutex::default(),
+@@ -569,26 +867,101 @@ impl TextSystem {
+     }
+ 
+     pub(crate) fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+-        let raster_bounds = self.raster_bounds.upgradable_read();
+-        if let Some(bounds) = raster_bounds.get(params) {
+-            Ok(*bounds)
+-        } else {
+-            let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
+-            let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
+-            raster_bounds.insert(params.clone(), bounds);
+-            Ok(bounds)
++        if let Some(bounds) = self.raster_bounds.read().get(params) {
++            return Ok(*bounds);
+         }
+-    }
+-
+-    pub(crate) fn rasterize_glyph(
++        // Measured without the lock: glyphs prepared on other threads
++        // (`prepare_glyphs`) do not hold up the ones painted meanwhile.
++        let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
++        self.raster_bounds.write().insert(params.clone(), bounds);
++        Ok(bounds)
++    }
++
++    /// A glyph's raster (its size and alpha, or colour, bytes): the one
++    /// [`Self::prepare_glyphs`] kept for it, which this consumes (the next
++    /// call rasterizes again), else the platform's, rasterized now. Painting
++    /// a glyph the sprite atlas does not have calls this. `params.font_id`
++    /// must be a font of this text system: another id panics.
++    pub fn rasterize_glyph(
+         &self,
+         params: &RenderGlyphParams,
+     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
++        {
++            let mut prepared = self.prepared_glyphs.lock();
++            if let Some(raster) = prepared.take(params) {
++                return Ok(raster);
++            }
++            prepared.painted(params);
++        }
+         let raster_bounds = self.raster_bounds(params)?;
+         self.platform_text_system
+             .rasterize_glyph(params, raster_bounds)
+     }
+ 
++    /// Rasterizes glyphs ahead of their painting, on the calling thread: a
++    /// background one, since rasterizing is what makes painting a glyph the
++    /// sprite atlas does not have yet costly (the platform draws it into a
++    /// bitmap, and on macOS the first glyph of a font at a new size queries
++    /// the font registry). A glyph painted later with the same parameters
++    /// ([`crate::Window::glyph_render_params`]) takes its prepared raster
++    /// instead of rasterizing, once. Prepared rasters are kept up to
++    /// [`MAX_PREPARED_GLYPH_BYTES`], the oldest dropped first, until
++    /// [`Self::release_prepared_glyphs`]; glyphs already prepared, painted
++    /// meanwhile (painting rasterized them), with nothing to draw, or whose
++    /// raster would take more than [`MAX_PREPARED_GLYPH_RASTER_BYTES`] are
++    /// skipped. The font ids must be this text system's: another id panics.
++    pub fn prepare_glyphs(&self, params: &[RenderGlyphParams]) {
++        for params in params {
++            if self.prepared_glyphs.lock().contains(params) {
++                continue;
++            }
++            let Ok(raster_bounds) = self.raster_bounds(params) else {
++                continue;
++            };
++            let (w, h) = (
++                raster_bounds.size.width.0.max(0) as usize,
++                raster_bounds.size.height.0.max(0) as usize,
++            );
++            // (colour glyphs and subpixel ones take four bytes a pixel; a
++            // subpixel variant one more row and column)
++            let per_pixel = if params.is_emoji || params.subpixel_rendering {
++                4
++            } else {
++                1
++            };
++            let bytes = (w + 1) * (h + 1) * per_pixel;
++            if w == 0 || h == 0 || bytes > MAX_PREPARED_GLYPH_RASTER_BYTES {
++                continue;
++            }
++            if let Ok((size, raster)) = self
++                .platform_text_system
++                .rasterize_glyph(params, raster_bounds)
++            {
++                let dropped = self
++                    .prepared_glyphs
++                    .lock()
++                    .insert(params.clone(), size, &raster);
++                // (measured only to be prepared: painting measures again)
++                if !dropped.is_empty() {
++                    self.forget_raster_bounds(dropped);
++                }
++            }
++        }
++    }
++
++    /// Drops every glyph raster [`Self::prepare_glyphs`] kept (their memory
++    /// too): for when the text they were prepared for no longer needs them
++    /// (a zoom ended).
++    pub fn release_prepared_glyphs(&self) {
++        let dropped = self.prepared_glyphs.lock().release();
++        self.forget_raster_bounds(dropped);
++    }
++
++    /// What became of the prepared rasters so far.
++    pub fn prepared_glyph_stats(&self) -> PreparedGlyphStats {
++        self.prepared_glyphs.lock().stats
++    }
++
+     /// Returns the dilation level to use for a glyph painted in the given color.
+     pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+         self.platform_text_system.glyph_dilation_for_color(color)
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 0990100..b06a945 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -4918,41 +4918,9 @@ impl Window {
+         self.invalidator.debug_assert_paint();
+ 
+         let element_opacity = self.element_opacity();
+-        let scale_factor = self.scale_factor();
+-        let glyph_origin = origin.scale(scale_factor);
+-
+-        let quantized_origin = Point::new(
+-            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+-                / SUBPIXEL_VARIANTS_X as f32,
+-            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+-                / SUBPIXEL_VARIANTS_Y as f32,
+-        );
+-        let subpixel_variant = Point::new(
+-            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+-            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+-        );
+-        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+-        let font_smoothing = self.font_smoothing;
+-        let smoothed = font_smoothing == FontSmoothing::PlatformDefault;
+-        let subpixel_rendering = smoothed
+-            && transformation == TransformationMatrix::unit()
+-            && self.should_use_subpixel_rendering(font_id, font_size);
+-        let dilation = if smoothed {
+-            self.text_system().glyph_dilation_for_color(color)
+-        } else {
+-            0
+-        };
+-        let params = RenderGlyphParams {
+-            font_id,
+-            glyph_id,
+-            font_size,
+-            subpixel_variant,
+-            scale_factor,
+-            is_emoji: false,
+-            subpixel_rendering,
+-            dilation,
+-            font_smoothing,
+-        };
++        let (params, integer_origin) =
++            self.glyph_params(origin, font_id, glyph_id, font_size, color, transformation);
++        let subpixel_rendering = params.subpixel_rendering;
+ 
+         let raster_bounds = self.text_system().raster_bounds(&params)?;
+         if !raster_bounds.is_zero() {
+@@ -4999,6 +4967,82 @@ impl Window {
+         Ok(())
+     }
+ 
++    /// Whether the window's sprite atlas has the raster of a glyph with
++    /// these parameters (painting it would not rasterize it): a glyph to
++    /// leave out of [`crate::TextSystem::prepare_glyphs`]. Atlases that do
++    /// not tell say no.
++    pub fn has_glyph_raster(&self, params: &RenderGlyphParams) -> bool {
++        self.sprite_atlas
++            .contains(&crate::AtlasKey::Glyph(params.clone()))
++    }
++
++    /// The parameters [`Window::paint_glyph_transformed`] rasterizes a glyph
++    /// with when it paints it now (with the current font smoothing), for
++    /// [`crate::TextSystem::prepare_glyphs`] to rasterize it ahead of time.
++    pub fn glyph_render_params(
++        &self,
++        origin: Point<Pixels>,
++        font_id: FontId,
++        glyph_id: GlyphId,
++        font_size: Pixels,
++        color: Hsla,
++        transformation: TransformationMatrix,
++    ) -> RenderGlyphParams {
++        self.glyph_params(origin, font_id, glyph_id, font_size, color, transformation)
++            .0
++    }
++
++    /// A monochrome glyph's raster parameters, and the whole device pixel
++    /// its raster is placed from.
++    fn glyph_params(
++        &self,
++        origin: Point<Pixels>,
++        font_id: FontId,
++        glyph_id: GlyphId,
++        font_size: Pixels,
++        color: Hsla,
++        transformation: TransformationMatrix,
++    ) -> (RenderGlyphParams, Point<ScaledPixels>) {
++        let scale_factor = self.scale_factor();
++        let glyph_origin = origin.scale(scale_factor);
++
++        let quantized_origin = Point::new(
++            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
++                / SUBPIXEL_VARIANTS_X as f32,
++            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
++                / SUBPIXEL_VARIANTS_Y as f32,
++        );
++        let subpixel_variant = Point::new(
++            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
++            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
++        );
++        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
++        let font_smoothing = self.font_smoothing;
++        let smoothed = font_smoothing == FontSmoothing::PlatformDefault;
++        let subpixel_rendering = smoothed
++            && transformation == TransformationMatrix::unit()
++            && self.should_use_subpixel_rendering(font_id, font_size);
++        let dilation = if smoothed {
++            self.text_system().glyph_dilation_for_color(color)
++        } else {
++            0
++        };
++        (
++            RenderGlyphParams {
++                font_id,
++                glyph_id,
++                font_size,
++                subpixel_variant,
++                scale_factor,
++                is_emoji: false,
++                subpixel_rendering,
++                dilation,
++                font_smoothing,
++            },
++            integer_origin,
++        )
++    }
++
+     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
+             return false;
+diff --git a/crates/gpui_apple/src/metal_atlas.rs b/crates/gpui_apple/src/metal_atlas.rs
+index f4514a4..c83e189 100644
+--- a/crates/gpui_apple/src/metal_atlas.rs
++++ b/crates/gpui_apple/src/metal_atlas.rs
+@@ -61,6 +61,10 @@ impl PlatformAtlas for MetalAtlas {
+     fn remove(&self, key: &AtlasKey) {
+         self.0.lock().remove(key);
+     }
++
++    fn contains(&self, key: &AtlasKey) -> bool {
++        self.0.lock().contains(key)
++    }
+ }
+ 
+ impl AtlasBackend for MetalAtlasTextures {
+diff --git a/crates/gpui_wgpu/src/wgpu_atlas.rs b/crates/gpui_wgpu/src/wgpu_atlas.rs
+index 19e7cab..8262538 100644
+--- a/crates/gpui_wgpu/src/wgpu_atlas.rs
++++ b/crates/gpui_wgpu/src/wgpu_atlas.rs
+@@ -134,6 +134,10 @@ impl PlatformAtlas for WgpuAtlas {
+     fn remove(&self, key: &AtlasKey) {
+         self.0.lock().remove(key);
+     }
++
++    fn contains(&self, key: &AtlasKey) -> bool {
++        self.0.lock().contains(key)
++    }
+ }
+ 
+ impl AtlasBackend for WgpuAtlasTextures {
+diff --git a/crates/gpui_windows/src/directx_atlas.rs b/crates/gpui_windows/src/directx_atlas.rs
+index cab61e4..2a9a441 100644
+--- a/crates/gpui_windows/src/directx_atlas.rs
++++ b/crates/gpui_windows/src/directx_atlas.rs
+@@ -100,6 +100,10 @@ impl PlatformAtlas for DirectXAtlas {
+     fn remove(&self, key: &AtlasKey) {
+         self.0.lock().remove(key);
+     }
++
++    fn contains(&self, key: &AtlasKey) -> bool {
++        self.0.lock().contains(key)
++    }
+ }
+ 
+ impl AtlasBackend for DirectXAtlasTextures {

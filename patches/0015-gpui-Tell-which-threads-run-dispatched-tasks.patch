@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 09:00:00 -0700
+Subject: [PATCH] gpui: Tell which threads run dispatched tasks
+
+A panic that escapes a task GPUI dispatches to GCD cannot unwind out of
+the dispatcher's C trampoline: the process aborts. An app's panic hook
+wants to know that the process is going down (to write recovery copies
+first) without guessing from thread names.
+
+The macOS dispatcher's trampoline now marks the thread it runs a task on
+(gpui::mark_dispatch_thread), and gpui::is_dispatch_thread() answers
+whether the current thread is one. spawn_realtime's threads are named
+("gpui-realtime"): Rust threads, where a panic ends the thread only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/executor.rs         | 19 +++++++++++++++++++
+ crates/gpui_macos/src/dispatcher.rs | 13 +++++++++----
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/crates/gpui/src/executor.rs b/crates/gpui/src/executor.rs
+index b4348e9..bcd4adc 100644
+--- a/crates/gpui/src/executor.rs
++++ b/crates/gpui/src/executor.rs
+@@ -13,6 +13,25 @@ pub use scheduler::{
+     DedicatedExecutor, FallibleTask, LocalExecutor as SchedulerLocalExecutor, Priority, Task,
+ };
+ 
++thread_local! {
++    static DISPATCH_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// Marks the current thread as one the platform dispatcher runs tasks on
++/// (GCD's workers and the main queue on macOS). Called by the dispatcher
++/// before it runs each task.
++pub fn mark_dispatch_thread() {
++    let _ = DISPATCH_THREAD.try_with(|d| d.set(true));
++}
++
++/// Whether the platform dispatcher has run a task on the current thread:
++/// a thread the platform owns, where a panic that escapes a task cannot
++/// unwind out of the dispatcher's trampoline and aborts the process (a
++/// panic hook uses this to know the process is going down).
++pub fn is_dispatch_thread() -> bool {
++    DISPATCH_THREAD.try_with(std::cell::Cell::get).unwrap_or(false)
++}
++
+ /// A pointer to the executor that is currently running,
+ /// for spawning background tasks.
+ #[derive(Clone)]
+diff --git a/crates/gpui_macos/src/dispatcher.rs b/crates/gpui_macos/src/dispatcher.rs
+index a50288c..8cbccf8 100644
+--- a/crates/gpui_macos/src/dispatcher.rs
++++ b/crates/gpui_macos/src/dispatcher.rs
+@@ -73,10 +73,14 @@ impl PlatformDispatcher for MacDispatcher {
+     }
+ 
+     fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
+-        std::thread::spawn(move || {
+-            set_audio_thread_priority().log_err();
+-            f();
+-        });
++        // (named: a Rust thread, where a panic ends the thread only)
++        std::thread::Builder::new()
++            .name("gpui-realtime".into())
++            .spawn(move || {
++                set_audio_thread_priority().log_err();
++                f();
++            })
++            .log_err();
+     }
+ 
+     fn prevent_app_nap(&self, reason: &str) -> ActivityGuard {
+@@ -202,6 +206,7 @@ extern "C" fn trampoline(context: *mut c_void) {
+     let location = runnable.metadata().location;
+     let spawned = runnable.metadata().spawned;
+     gpui::profiler::update_running_task(spawned, location);
++    gpui::mark_dispatch_thread();
+     runnable.run();
+     gpui::profiler::save_task_timing();
+ }

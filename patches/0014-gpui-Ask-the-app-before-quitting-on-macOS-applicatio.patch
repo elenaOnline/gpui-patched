@@ -1,0 +1,422 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 12:39:26 -0700
+Subject: [PATCH] gpui: Ask the app before quitting on macOS
+ (applicationShouldTerminate:)
+
+GPUI's macOS app delegate had no applicationShouldTerminate:, so the Dock's
+Quit, logging out, restarting, shutting down and AppleScript's quit (and
+App::quit, which sends terminate:) terminated the application without
+giving it a chance to ask about unsaved work: on_app_quit handlers run when
+it is already too late to cancel.
+
+App::on_should_quit(handler) sets the handler AppKit's
+applicationShouldTerminate: asks. It answers QuitResponse::Now, Cancel or
+Later (NSTerminateNow / Cancel / Later); with Later the application keeps
+running (AppKit holds a logout, restart or shutdown meanwhile) until it
+calls App::reply_to_quit(bool) (replyToApplicationShouldTerminate:).
+Without a handler the delegate answers Now, as before. A request that
+arrives while the app is being updated is asked again once it is free
+(answered Later meanwhile, then replied).
+
+Platform gains on_should_quit and reply_to_should_quit with no-op default
+implementations (platforms that do not ask never call the handler). The
+test platform records the replies: TestApp::simulate_quit_request and
+TestApp::quit_replies drive a handler as AppKit would.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/app.rs                    | 75 +++++++++++++++++++++--
+ crates/gpui/src/app/test_app.rs           | 45 ++++++++++++++
+ crates/gpui/src/platform.rs               | 22 +++++++
+ crates/gpui/src/platform/test/platform.rs | 35 ++++++++++-
+ crates/gpui_macos/src/platform.rs         | 45 +++++++++++++-
+ 5 files changed, 213 insertions(+), 9 deletions(-)
+
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index e2eb3b5..42f7fad 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -48,10 +48,11 @@ use crate::{
+     KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu,
+     PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
+     PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
+-    PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
+-    SharedString, SubscriberSet, Subscription, SvgRenderer, SystemNotification,
+-    SystemNotificationResponse, Task, TextRenderingMode, TextSystem, ThermalState, Window,
+-    WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
++    PromptLevel, QuitResponse, Render, RenderImage, RenderablePromptHandle, Reservation,
++    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
++    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
++    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
++    WindowInvalidator,
+     colors::{Colors, GlobalColors},
+     hash, init_app_menus,
+ };
+@@ -320,6 +321,7 @@ type MissingGlyphCallback = Box<dyn FnMut(&[MissingGlyph], &mut App) + 'static>;
+ pub(crate) type KeystrokeObserver =
+     Box<dyn FnMut(&KeystrokeEvent, &mut Window, &mut App) -> bool + 'static>;
+ type QuitHandler = Box<dyn FnOnce(&mut App) -> LocalBoxFuture<'static, ()> + 'static>;
++type ShouldQuitHandler = Box<dyn FnMut(&mut App) -> QuitResponse + 'static>;
+ type WindowClosedHandler = Box<dyn FnMut(&mut App, WindowId)>;
+ type ReleaseListener = Box<dyn FnOnce(&mut dyn Any, &mut App) + 'static>;
+ type NewEntityListener = Box<dyn FnMut(AnyEntity, &mut Option<&mut Window>, &mut App) + 'static>;
+@@ -777,6 +779,7 @@ pub struct App {
+     pub(crate) release_listeners: SubscriberSet<EntityId, ReleaseListener>,
+     pub(crate) global_observers: SubscriberSet<TypeId, Handler>,
+     pub(crate) quit_observers: SubscriberSet<(), QuitHandler>,
++    should_quit_handler: Option<ShouldQuitHandler>,
+     pub(crate) restart_observers: SubscriberSet<(), Handler>,
+     pub(crate) window_closed_observers: SubscriberSet<(), WindowClosedHandler>,
+ 
+@@ -912,6 +915,7 @@ impl App {
+                 system_wake_observers: SubscriberSet::new(),
+                 global_observers: SubscriberSet::new(),
+                 quit_observers: SubscriberSet::new(),
++                should_quit_handler: None,
+                 restart_observers: SubscriberSet::new(),
+                 restart_path: None,
+                 restart_arguments: Vec::new(),
+@@ -1015,6 +1019,38 @@ impl App {
+             }
+         }));
+ 
++        platform.on_should_quit(Box::new({
++            let cx = Rc::downgrade(&app);
++            let foreground_executor = app.borrow().foreground_executor.clone();
++            move || {
++                let Some(cx) = cx.upgrade() else {
++                    return QuitResponse::Now;
++                };
++                match cx.try_borrow_mut() {
++                    Ok(mut cx) => cx.update(|cx| cx.should_quit()),
++                    Err(_) => {
++                        // Asked while the app is being updated: ask again once it is free, and
++                        // answer then.
++                        let cx = Rc::downgrade(&cx);
++                        foreground_executor
++                            .spawn(async move {
++                                let Some(cx) = cx.upgrade() else {
++                                    return;
++                                };
++                                let mut cx = cx.borrow_mut();
++                                match cx.update(|cx| cx.should_quit()) {
++                                    QuitResponse::Now => cx.platform.reply_to_should_quit(true),
++                                    QuitResponse::Cancel => cx.platform.reply_to_should_quit(false),
++                                    QuitResponse::Later => {}
++                                }
++                            })
++                            .detach();
++                        QuitResponse::Later
++                    }
++                }
++            }
++        }));
++
+         app
+     }
+ 
+@@ -1108,10 +1144,41 @@ impl App {
+     }
+ 
+     /// Gracefully quit the application via the platform's standard routine.
++    ///
++    /// On macOS this asks the handler set with [`Self::on_should_quit`] first, as every other
++    /// request to quit does.
+     pub fn quit(&self) {
+         self.platform.quit();
+     }
+ 
++    /// Sets the handler asked whether the application may quit when something asks it to: on
++    /// macOS, `applicationShouldTerminate:` (the Quit menu item and [`Self::quit`], the Dock's
++    /// Quit, logging out, restarting or shutting down, an Apple Event such as AppleScript's
++    /// `quit`). It answers [`QuitResponse::Now`], [`QuitResponse::Cancel`] or
++    /// [`QuitResponse::Later`], and then, when it has decided (after asking about unsaved
++    /// changes, say), calls [`Self::reply_to_quit`]. Replaces an earlier handler. Without one
++    /// the application quits at once. Platforms that do not ask never call it.
++    pub fn on_should_quit(&mut self, handler: impl FnMut(&mut App) -> QuitResponse + 'static) {
++        self.should_quit_handler = Some(Box::new(handler));
++    }
++
++    /// Answers a quit request that the [`Self::on_should_quit`] handler put off with
++    /// [`QuitResponse::Later`]: `true` quits (the handlers of [`Self::on_app_quit`] run), `false`
++    /// cancels the quit (and a logout, restart or shutdown that asked).
++    pub fn reply_to_quit(&self, quit: bool) {
++        self.platform.reply_to_should_quit(quit);
++    }
++
++    fn should_quit(&mut self) -> QuitResponse {
++        let Some(mut handler) = self.should_quit_handler.take() else {
++            return QuitResponse::Now;
++        };
++        let response = handler(self);
++        // (unless the handler set another)
++        self.should_quit_handler.get_or_insert(handler);
++        response
++    }
++
+     /// Returns the current policy for hiding the cursor in response to
+     /// keyboard input.
+     pub fn cursor_hide_mode(&self) -> CursorHideMode {
+diff --git a/crates/gpui/src/app/test_app.rs b/crates/gpui/src/app/test_app.rs
+index 108d302..9d85dec 100644
+--- a/crates/gpui/src/app/test_app.rs
++++ b/crates/gpui/src/app/test_app.rs
+@@ -304,6 +304,20 @@ impl TestApp {
+         self.platform.simulate_prompt_answer(button);
+     }
+ 
++    /// Simulate the system asking the app to quit (macOS's `applicationShouldTerminate:`: the
++    /// Dock's Quit, logging out, shutting down). Returns what the
++    /// [`App::on_should_quit`] handler answered; runs until parked afterwards.
++    pub fn simulate_quit_request(&mut self) -> crate::QuitResponse {
++        let response = self.platform.simulate_should_quit();
++        self.run_until_parked();
++        response
++    }
++
++    /// The answers the app gave with [`App::reply_to_quit`] so far, oldest first.
++    pub fn quit_replies(&self) -> Vec<bool> {
++        self.platform.quit_replies()
++    }
++
+     /// Get all open windows.
+     pub fn windows(&self) -> Vec<AnyWindowHandle> {
+         self.read(|cx| cx.windows())
+@@ -645,4 +659,35 @@ mod tests {
+             assert_eq!(global.0, "world");
+         });
+     }
++
++    #[test]
++    fn test_should_quit() {
++        use crate::QuitResponse;
++        let mut app = TestApp::new();
++        // no handler: quits at once
++        assert_eq!(app.simulate_quit_request(), QuitResponse::Now);
++
++        // a handler that asks first, then answers
++        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
++        let count = asked.clone();
++        app.update(|cx| {
++            cx.on_should_quit(move |cx| {
++                count.set(count.get() + 1);
++                let task = cx.spawn(async move |cx| {
++                    cx.update(|cx| cx.reply_to_quit(false));
++                });
++                task.detach();
++                QuitResponse::Later
++            })
++        });
++        assert_eq!(app.simulate_quit_request(), QuitResponse::Later);
++        assert_eq!(asked.get(), 1);
++        assert_eq!(app.quit_replies(), [false]);
++
++        // replaced
++        app.update(|cx| cx.on_should_quit(|_| QuitResponse::Cancel));
++        assert_eq!(app.simulate_quit_request(), QuitResponse::Cancel);
++        assert_eq!(asked.get(), 1);
++        assert_eq!(app.quit_replies(), [false]);
++    }
+ }
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 1bd36f9..3753f48 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -261,6 +261,14 @@ pub trait Platform: 'static {
+     fn open_with_system(&self, path: &Path);
+ 
+     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>);
++    /// Registers the callback asked whether the application may quit when something asks it to
++    /// (macOS `applicationShouldTerminate:`: the Quit menu item, the Dock, logging out,
++    /// restarting, shutting down, an Apple Event). Platforms that do not ask (the default)
++    /// never call it. See [`crate::App::on_should_quit`].
++    fn on_should_quit(&self, _callback: Box<dyn FnMut() -> QuitResponse>) {}
++    /// Answers a quit request the callback put off with [`QuitResponse::Later`]: `true` quits,
++    /// `false` cancels it.
++    fn reply_to_should_quit(&self, _quit: bool) {}
+     fn on_reopen(&self, callback: Box<dyn FnMut()>);
+     /// Registers the callback invoked when the system is about to sleep.
+     fn on_system_sleep(&self, callback: Box<dyn FnMut()>);
+@@ -814,6 +822,20 @@ pub struct RequestFrameOptions {
+     pub force_render: bool,
+ }
+ 
++/// What an application answers when asked whether it may quit (see
++/// [`crate::App::on_should_quit`]; macOS `NSApplicationTerminateReply`).
++#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
++pub enum QuitResponse {
++    /// Quit now.
++    Now,
++    /// Do not quit (logging out, restarting or shutting down stops too).
++    Cancel,
++    /// Decide later (after asking the user): the application answers with
++    /// [`crate::App::reply_to_quit`]. Meanwhile it runs as usual; macOS
++    /// holds a logout, restart or shutdown until then.
++    Later,
++}
++
+ /// The application's lifecycle phase, as owned and reported by a mobile OS.
+ ///
+ /// `Inactive` means visible but not receiving input (a system dialog on
+diff --git a/crates/gpui/src/platform/test/platform.rs b/crates/gpui/src/platform/test/platform.rs
+index 77a6441..dde115c 100644
+--- a/crates/gpui/src/platform/test/platform.rs
++++ b/crates/gpui/src/platform/test/platform.rs
+@@ -6,9 +6,9 @@ use crate::{
+     ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
+     DummyKeyboardMapper, ForegroundExecutor, Keymap, OwnedMenu, Platform, PlatformDisplay,
+     PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+-    PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, SharedString,
+-    SourceMetadata, SystemNotification, SystemNotificationResponse, Task, TestDisplay, TestWindow,
+-    ThermalState, WindowAppearance, WindowParams, size,
++    PromptButton, QuitResponse, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
++    SharedString, SourceMetadata, SystemNotification, SystemNotificationResponse, Task,
++    TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams, size,
+ };
+ use anyhow::Result;
+ #[cfg(any(test, feature = "test-support"))]
+@@ -53,6 +53,8 @@ pub(crate) struct TestPlatform {
+     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
+     weak: Weak<Self>,
+     menus: RefCell<Vec<OwnedMenu>>,
++    should_quit: RefCell<Option<Box<dyn FnMut() -> QuitResponse>>>,
++    quit_replies: RefCell<Vec<bool>>,
+ }
+ 
+ #[derive(Clone)]
+@@ -171,9 +173,28 @@ impl TestPlatform {
+             text_system,
+             headless_renderer_factory,
+             menus: Default::default(),
++            should_quit: Default::default(),
++            quit_replies: Default::default(),
+         })
+     }
+ 
++    /// Asks the app whether it may quit, as macOS's `applicationShouldTerminate:` does (the
++    /// Dock's Quit, logging out): what the [`crate::App::on_should_quit`] handler answers, or
++    /// [`QuitResponse::Now`] without one.
++    pub(crate) fn simulate_should_quit(&self) -> QuitResponse {
++        let Some(mut callback) = self.should_quit.borrow_mut().take() else {
++            return QuitResponse::Now;
++        };
++        let response = callback();
++        self.should_quit.borrow_mut().get_or_insert(callback);
++        response
++    }
++
++    /// The answers given with [`crate::App::reply_to_quit`] so far, oldest first.
++    pub(crate) fn quit_replies(&self) -> Vec<bool> {
++        self.quit_replies.borrow().clone()
++    }
++
+     #[cfg(any(test, feature = "test-support"))]
+     pub(crate) fn simulate_new_path_selection(
+         &self,
+@@ -580,6 +601,14 @@ impl Platform for TestPlatform {
+ 
+     fn on_quit(&self, _callback: Box<dyn FnMut() -> bool>) {}
+ 
++    fn on_should_quit(&self, callback: Box<dyn FnMut() -> QuitResponse>) {
++        *self.should_quit.borrow_mut() = Some(callback);
++    }
++
++    fn reply_to_should_quit(&self, quit: bool) {
++        self.quit_replies.borrow_mut().push(quit);
++    }
++
+     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {
+         unimplemented!()
+     }
+diff --git a/crates/gpui_macos/src/platform.rs b/crates/gpui_macos/src/platform.rs
+index 4806b73..7ebf37e 100644
+--- a/crates/gpui_macos/src/platform.rs
++++ b/crates/gpui_macos/src/platform.rs
+@@ -32,8 +32,9 @@ use gpui::{
+     Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorImage,
+     CursorImageId, CursorStyle, ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, OsMenu,
+     OwnedMenu, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
+-    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Result, SystemMenuType, Task,
+-    ThermalState, WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
++    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, QuitResponse, Result,
++    SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind, WindowParams,
++    popup::PopupNotSupportedError,
+ };
+ use gpui_util::{ResultExt, new_std_command};
+ use itertools::Itertools;
+@@ -99,6 +100,10 @@ unsafe fn build_classes() {
+                 sel!(applicationShouldHandleReopen:hasVisibleWindows:),
+                 should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool),
+             );
++            decl.add_method(
++                sel!(applicationShouldTerminate:),
++                should_terminate as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
++            );
+             decl.add_method(
+                 sel!(applicationWillTerminate:),
+                 will_terminate as extern "C" fn(&mut Object, Sel, id),
+@@ -191,6 +196,7 @@ pub(crate) struct MacPlatformState {
+     on_system_wake: Option<Box<dyn FnMut()>>,
+     system_power_observers_registered: bool,
+     quit: Option<Box<dyn FnMut() -> bool>>,
++    should_quit: Option<Box<dyn FnMut() -> QuitResponse>>,
+     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
+     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
+     will_open_menu: Option<Box<dyn FnMut()>>,
+@@ -236,6 +242,7 @@ impl MacPlatform {
+             find_pasteboard: Pasteboard::find(),
+             reopen: None,
+             quit: None,
++            should_quit: None,
+             menu_command: None,
+             validate_menu_command: None,
+             will_open_menu: None,
+@@ -982,6 +989,18 @@ impl Platform for MacPlatform {
+         self.0.lock().quit = Some(callback);
+     }
+ 
++    fn on_should_quit(&self, callback: Box<dyn FnMut() -> QuitResponse>) {
++        self.0.lock().should_quit = Some(callback);
++    }
++
++    fn reply_to_should_quit(&self, quit: bool) {
++        unsafe {
++            let app = NSApplication::sharedApplication(nil);
++            let _: () =
++                msg_send![app, replyToApplicationShouldTerminate: if quit { YES } else { NO }];
++        }
++    }
++
+     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
+         self.0.lock().reopen = Some(callback);
+     }
+@@ -1397,6 +1416,28 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
+     }
+ }
+ 
++/// `applicationShouldTerminate:`: asks the app ([`Platform::on_should_quit`]); without a
++/// callback, `NSTerminateNow`.
++extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
++    // NSApplicationTerminateReply
++    const NS_TERMINATE_CANCEL: NSUInteger = 0;
++    const NS_TERMINATE_NOW: NSUInteger = 1;
++    const NS_TERMINATE_LATER: NSUInteger = 2;
++    let platform = unsafe { get_mac_platform(this) };
++    let mut lock = platform.0.lock();
++    let Some(mut callback) = lock.should_quit.take() else {
++        return NS_TERMINATE_NOW;
++    };
++    drop(lock);
++    let response = callback();
++    platform.0.lock().should_quit.get_or_insert(callback);
++    match response {
++        QuitResponse::Now => NS_TERMINATE_NOW,
++        QuitResponse::Cancel => NS_TERMINATE_CANCEL,
++        QuitResponse::Later => NS_TERMINATE_LATER,
++    }
++}
++
+ extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
+     let platform = unsafe { get_mac_platform(this) };
+     let mut lock = platform.0.lock();

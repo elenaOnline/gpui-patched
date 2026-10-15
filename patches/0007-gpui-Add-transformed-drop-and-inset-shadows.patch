@@ -1,0 +1,831 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elena Maher <12779416+elenaOnline@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 00:41:56 -0700
+Subject: [PATCH] gpui: Add transformed drop and inset shadows
+
+Box shadows could only be drawn for axis-aligned elements: the Shadow
+primitive's blurred rounded rect was evaluated in screen space. A canvas
+showing rotated cards (sticky notes with CSS-like shadows) had no way to
+cast an exact shadow under any rotation.
+
+Shadow gets a `transformation` (like MonochromeSprite and
+PolychromeSprite), and Window::paint_drop_shadows_transformed and
+Window::paint_inset_shadows_transformed take one in scaled pixels, as
+paint_image_transformed does (paint_drop_shadows and paint_inset_shadows
+are the identity case). The element's bounds, the shadows' offsets, blur
+and spread are in the element's own space; the vertex shaders transform
+the shadow's quad (grown by three standard deviations for a drop shadow,
+the element for an inset one) and pass the point in shadow space to the
+fragment shaders, which evaluate the blur there. Hard edges (no blur, the
+inset clip to the element) of a transformed shadow are anti-aliased by
+their screen-space gradient, as transformed sprites are. Untransformed
+shadows keep their snapped bounds and screen-space evaluation.
+
+The scene culls and orders a transformed shadow by the bounding box of its
+transformed quad (Primitive::painted_bounds), blur included.
+
+Window::paint_outer_shadows_transformed draws drop shadows as CSS draws an
+outer box-shadow: clipped inside the element's border box (Shadow's
+`inset` field gets a third value, 2), so a translucent element does not
+show its own shadow through it. paint_drop_shadows keeps GPUI's unclipped
+drop shadows.
+
+Window::with_shadow_clip clips the shadows painted inside it to a turned
+rectangle (ShadowClip: scaled px -> the rectangle's own space and its
+size), anti-aliased in the fragment shader, as a rotated container clips
+its children's box shadows; content masks can only be axis-aligned.
+
+Metal, WGSL (validated by the gpui_wgpu naga tests) and HLSL
+(unvalidated) shaders are updated alike; the WebGL instance decoder reads
+the fourteen extra words.
+---
+ crates/gpui/src/scene.rs                |  32 ++-
+ crates/gpui/src/window.rs               | 254 +++++++++++++++++++++++-
+ crates/gpui_apple/src/shaders.metal     |  51 ++++-
+ crates/gpui_wgpu/src/shaders.wgsl       |  52 ++++-
+ crates/gpui_wgpu/src/shaders_webgl.wgsl |   5 +-
+ crates/gpui_wgpu/src/wgpu_renderer.rs   |   2 +-
+ crates/gpui_windows/src/shaders.hlsl    |  46 ++++-
+ 7 files changed, 403 insertions(+), 39 deletions(-)
+
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index b1169c7..22d56e7 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -245,13 +245,17 @@ impl Primitive {
+         }
+     }
+ 
+-    /// The area the primitive paints: its bounds, or for a transformed sprite the bounding box
+-    /// of its transformed bounds (with the device pixel its anti-aliased edges extend into).
++    /// The area the primitive paints: its bounds, or for a transformed sprite or shadow the
++    /// bounding box of its transformed bounds (with the device pixel its anti-aliased edges
++    /// extend into; for a drop shadow, with its blur).
+     pub fn painted_bounds(&self) -> Bounds<ScaledPixels> {
+         let (bounds, transformation) = match self {
+             Primitive::MonochromeSprite(sprite) => (sprite.bounds, sprite.transformation),
+             Primitive::SubpixelSprite(sprite) => (sprite.bounds, sprite.transformation),
+             Primitive::PolychromeSprite(sprite) => (sprite.bounds, sprite.transformation),
++            Primitive::Shadow(shadow) if shadow.transformation != TransformationMatrix::unit() => {
++                (shadow.painted_geometry(), shadow.transformation)
++            }
+             _ => return *self.bounds(),
+         };
+         if transformation == TransformationMatrix::unit() {
+@@ -597,9 +601,31 @@ pub struct Shadow {
+     pub color: Hsla,
+     pub element_bounds: Bounds<ScaledPixels>,
+     pub element_corner_radii: Corners<ScaledPixels>,
+-    /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
++    /// 0 = drop shadow, 1 = inset shadow (rendered inside the element), 2 = drop shadow
++    /// rendered outside the element only (CSS: an outer box-shadow is clipped inside the
++    /// border box).
+     pub inset: u32,
+     pub pad: u32, // align to 8 bytes
++    /// Maps the shadow's space (its bounds, element bounds and blur) to the scene, like a
++    /// sprite's transformation.
++    pub transformation: TransformationMatrix,
++    /// A turned rectangle the shadow is clipped to (see [`crate::ShadowClip`]): scene →
++    /// the rectangle's own space, where it spans `clip_size` from the origin. No clip when
++    /// `clip_size` is empty.
++    pub clip_transformation: TransformationMatrix,
++    pub clip_size: Size<ScaledPixels>,
++}
++
++impl Shadow {
++    /// The quad the shadow is rasterized over, in its own space: the element for an inset
++    /// shadow, else the shadow rect with room for the gaussian tail.
++    pub fn painted_geometry(&self) -> Bounds<ScaledPixels> {
++        if self.inset == 1 {
++            self.element_bounds
++        } else {
++            self.bounds.dilate(self.blur_radius * 3.)
++        }
++    }
+ }
+ 
+ impl From<Shadow> for Primitive {
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index f6738b2..5bdfa0f 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1179,6 +1179,7 @@ pub struct Window {
+     pub(crate) rendered_entity_stack: Vec<EntityId>,
+     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
+     pub(crate) element_opacity: f32,
++    shadow_clip: Option<ShadowClip>,
+     font_smoothing: FontSmoothing,
+     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
+@@ -2041,6 +2042,7 @@ impl Window {
+             element_offset_stack: Vec::new(),
+             content_mask_stack: Vec::new(),
+             element_opacity: 1.0,
++            shadow_clip: None,
+             font_smoothing: FontSmoothing::default(),
+             requested_autoscroll: None,
+             last_text_input_configuration: None,
+@@ -4401,13 +4403,84 @@ impl Window {
+         bounds: Bounds<Pixels>,
+         corner_radii: Corners<Pixels>,
+         shadows: &[BoxShadow],
++    ) {
++        self.paint_drop_shadows_transformed(
++            bounds,
++            corner_radii,
++            shadows,
++            TransformationMatrix::unit(),
++        );
++    }
++
++    /// Paint drop shadows like [`Self::paint_drop_shadows`], for an element placed by
++    /// `transformation` (in scaled pixels, as [`Self::paint_image_transformed`] takes it): the
++    /// element's bounds, the shadows' offsets, blur and spread are in its own space, and the
++    /// GPU evaluates the blurred rounded rect there, so rotated, scaled or skewed elements cast
++    /// exact shadows. The bounds of a transformed element are not snapped to device pixels.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_drop_shadows_transformed(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++        shadows: &[BoxShadow],
++        transformation: TransformationMatrix,
++    ) {
++        self.insert_drop_shadows(bounds, corner_radii, shadows, transformation, 0);
++    }
++
++    /// Paint drop shadows like [`Self::paint_drop_shadows_transformed`], drawn outside the
++    /// element only, as CSS draws an outer `box-shadow` (clipped inside the border box): a
++    /// translucent element then does not show its own shadow through it.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_outer_shadows_transformed(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++        shadows: &[BoxShadow],
++        transformation: TransformationMatrix,
++    ) {
++        self.insert_drop_shadows(bounds, corner_radii, shadows, transformation, 2);
++    }
++
++    /// Clips the shadows painted in `f` to a turned rectangle as well as the content mask
++    /// (`None`: no such clip), as a rotated container clips its children's box shadows.
++    /// Anti-aliased; nested calls replace the clip.
++    pub fn with_shadow_clip<R>(
++        &mut self,
++        clip: Option<ShadowClip>,
++        f: impl FnOnce(&mut Self) -> R,
++    ) -> R {
++        let previous = std::mem::replace(&mut self.shadow_clip, clip);
++        let result = f(self);
++        self.shadow_clip = previous;
++        result
++    }
++
++    /// The current shadow clip as a [`Shadow`] carries it.
++    fn shadow_clip_fields(&self) -> (TransformationMatrix, Size<ScaledPixels>) {
++        match self.shadow_clip {
++            Some(clip) => (clip.to_clip, clip.size),
++            None => (TransformationMatrix::unit(), Size::default()),
++        }
++    }
++
++    fn insert_drop_shadows(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++        shadows: &[BoxShadow],
++        transformation: TransformationMatrix,
++        mode: u32,
+     ) {
+         self.invalidator.debug_assert_paint();
+ 
+         let scale_factor = self.scale_factor();
+         let content_mask = self.snapped_content_mask();
+         let opacity = self.element_opacity();
+-        let element_bounds = self.cover_bounds(bounds);
++        let (clip_transformation, clip_size) = self.shadow_clip_fields();
++        let element_bounds = self.shadow_bounds(bounds, transformation);
+         let element_corner_radii = corner_radii.scale(scale_factor);
+         for shadow in shadows {
+             if shadow.inset {
+@@ -4417,18 +4490,34 @@ impl Window {
+             self.next_frame.scene.insert_primitive(Shadow {
+                 order: 0,
+                 blur_radius: shadow.blur_radius.scale(scale_factor),
+-                bounds: self.cover_bounds(shadow_bounds),
++                bounds: self.shadow_bounds(shadow_bounds, transformation),
+                 content_mask,
+                 corner_radii: corner_radii.scale(scale_factor),
+                 color: shadow.color.opacity(opacity),
+                 element_bounds,
+                 element_corner_radii,
+-                inset: 0,
++                inset: mode,
+                 pad: 0,
++                transformation,
++                clip_transformation,
++                clip_size,
+             });
+         }
+     }
+ 
++    /// Scaled bounds of a shadow's element: snapped to device pixels unless transformed.
++    fn shadow_bounds(
++        &self,
++        bounds: Bounds<Pixels>,
++        transformation: TransformationMatrix,
++    ) -> Bounds<ScaledPixels> {
++        if transformation == TransformationMatrix::unit() {
++            self.cover_bounds(bounds)
++        } else {
++            bounds.scale(self.scale_factor())
++        }
++    }
++
+     /// Paint the inset shadows from `shadows` into the scene at the current z-index. Should
+     /// be called after the element's background so the shadow layers on top of the fill.
+     /// Drop shadows are skipped; paint those with [`Self::paint_drop_shadows`] before the background.
+@@ -4437,13 +4526,33 @@ impl Window {
+         bounds: Bounds<Pixels>,
+         corner_radii: Corners<Pixels>,
+         shadows: &[BoxShadow],
++    ) {
++        self.paint_inset_shadows_transformed(
++            bounds,
++            corner_radii,
++            shadows,
++            TransformationMatrix::unit(),
++        );
++    }
++
++    /// Paint inset shadows like [`Self::paint_inset_shadows`], for an element placed by
++    /// `transformation` (see [`Self::paint_drop_shadows_transformed`]).
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_inset_shadows_transformed(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++        shadows: &[BoxShadow],
++        transformation: TransformationMatrix,
+     ) {
+         self.invalidator.debug_assert_paint();
+ 
+         let scale_factor = self.scale_factor();
+         let content_mask = self.snapped_content_mask();
+         let opacity = self.element_opacity();
+-        let element_bounds = self.cover_bounds(bounds);
++        let (clip_transformation, clip_size) = self.shadow_clip_fields();
++        let element_bounds = self.shadow_bounds(bounds, transformation);
+         let element_corner_radii = corner_radii.scale(scale_factor);
+         for shadow in shadows {
+             if !shadow.inset {
+@@ -4462,7 +4571,7 @@ impl Window {
+             self.next_frame.scene.insert_primitive(Shadow {
+                 order: 0,
+                 blur_radius: shadow.blur_radius.scale(scale_factor),
+-                bounds: self.cover_bounds(hole),
++                bounds: self.shadow_bounds(hole, transformation),
+                 content_mask,
+                 corner_radii: hole_corner_radii.scale(scale_factor),
+                 color: shadow.color.opacity(opacity),
+@@ -4470,6 +4579,9 @@ impl Window {
+                 element_corner_radii,
+                 inset: 1,
+                 pad: 0,
++                transformation,
++                clip_transformation,
++                clip_size,
+             });
+         }
+     }
+@@ -7775,6 +7887,18 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
+     }
+ }
+ 
++/// A turned rectangle box shadows can be clipped to ([`Window::with_shadow_clip`]):
++/// `to_clip` maps scaled pixels to the rectangle's own space, where it spans `size` from the
++/// origin (so the map is a rotation and a translation, keeping pixel distances for the
++/// anti-aliasing).
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct ShadowClip {
++    /// Scaled pixels → the rectangle's own space.
++    pub to_clip: TransformationMatrix,
++    /// The rectangle's size in its own space, from the origin.
++    pub size: Size<ScaledPixels>,
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::{
+@@ -8359,6 +8483,126 @@ mod tests {
+         assert_eq!(observed_drops.borrow().as_slice(), [path]);
+     }
+ 
++    /// Transformed shadows keep their exact bounds in their own space (the transformation places
++    /// them) and carry the transformation; a drop shadow is culled by its transformed bounds
++    /// grown by its blur. Untransformed shadows stay snapped to device pixels.
++    #[gpui::test]
++    fn test_paint_shadows_transformed(cx: &mut TestAppContext) {
++        use crate::{BoxShadow, Corners, ShadowClip, Size, TransformationMatrix, hsla, radians};
++
++        test_underline_paint_at_scales(cx, move |window| {
++            let scale = window.scale_factor();
++            let bounds = Bounds::new(point(px(-1.3), px(2.6)), size(px(10.2), px(5.1)));
++            let drop = BoxShadow::new(px(0.), px(3.), hsla(0., 0., 0., 0.5)).blur_radius(px(4.));
++            let inset = BoxShadow::new(px(0.), px(8.), hsla(0., 0., 0., 0.1))
++                .blur_radius(px(2.))
++                .spread_radius(px(-1.))
++                .inset();
++            let shadows = [drop.clone(), inset];
++            let paint = |window: &mut Window, transformation| {
++                window.next_frame.scene.clear();
++                window.paint_drop_shadows_transformed(
++                    bounds,
++                    Corners::all(px(1.)),
++                    &shadows,
++                    transformation,
++                );
++                window.paint_inset_shadows_transformed(
++                    bounds,
++                    Corners::all(px(1.)),
++                    &shadows,
++                    transformation,
++                );
++                window.next_frame.scene.shadows.clone()
++            };
++
++            let unit = paint(window, TransformationMatrix::unit());
++            assert_eq!(unit.len(), 2);
++            assert_eq!(unit[0].inset, 0);
++            assert_eq!(unit[1].inset, 1);
++
++            // A shadow clip rides along with every shadow painted inside it.
++            let clip = ShadowClip {
++                to_clip: TransformationMatrix::unit().rotate(radians(0.3)),
++                size: size(ScaledPixels(40.), ScaledPixels(30.)),
++            };
++            window.next_frame.scene.clear();
++            window.with_shadow_clip(Some(clip), |window| {
++                window.paint_drop_shadows(bounds, Corners::all(px(1.)), &shadows);
++                window.paint_inset_shadows(bounds, Corners::all(px(1.)), &shadows);
++            });
++            let clipped = window.next_frame.scene.shadows.clone();
++            assert_eq!(clipped.len(), 2);
++            assert!(
++                clipped
++                    .iter()
++                    .all(|s| s.clip_transformation == clip.to_clip && s.clip_size == clip.size)
++            );
++            assert_eq!(unit[0].clip_size, Size::default(), "no clip outside");
++
++            // Outer shadows are drop shadows clipped outside the element (mode 2).
++            window.next_frame.scene.clear();
++            window.paint_outer_shadows_transformed(
++                bounds,
++                Corners::all(px(1.)),
++                &shadows,
++                TransformationMatrix::unit(),
++            );
++            let outer = window.next_frame.scene.shadows.clone();
++            assert_eq!(outer.len(), 1);
++            assert_eq!(outer[0].inset, 2);
++            assert_eq!(outer[0].bounds, unit[0].bounds);
++            assert_eq!(
++                outer[0].painted_geometry(),
++                unit[0].bounds.dilate(unit[0].blur_radius * 3.)
++            );
++            assert_eq!(unit[0].element_bounds, window.cover_bounds(bounds));
++            assert!(
++                unit.iter()
++                    .all(|s| s.transformation == TransformationMatrix::unit())
++            );
++
++            let rotation = TransformationMatrix::unit()
++                .translate(point(ScaledPixels(40.), ScaledPixels(30.)))
++                .rotate(radians(0.5));
++            let rotated = paint(window, rotation);
++            assert_eq!(rotated.len(), 2);
++            assert_eq!(rotated[0].element_bounds, bounds.scale(scale));
++            assert_eq!(
++                rotated[0].bounds,
++                (bounds + point(px(0.), px(3.))).scale(scale)
++            );
++            assert_eq!(
++                rotated[1].bounds,
++                (bounds + point(px(0.), px(8.))).dilate(px(1.)).scale(scale)
++            );
++            assert!(rotated.iter().all(|s| s.transformation == rotation));
++
++            // Out of view before the transformation, in view after it.
++            let back = TransformationMatrix::unit()
++                .translate(point(ScaledPixels(3000. * scale), ScaledPixels(0.)));
++            let far = Bounds::new(point(px(-3000.), px(0.)), size(px(10.), px(10.)));
++            window.next_frame.scene.clear();
++            window.paint_drop_shadows_transformed(
++                far,
++                Corners::default(),
++                std::slice::from_ref(&drop),
++                back,
++            );
++            assert_eq!(window.next_frame.scene.shadows.len(), 1);
++            // Only its blur reaches into view.
++            let edge = Bounds::new(point(px(-3012.), px(0.)), size(px(10.), px(10.)));
++            window.next_frame.scene.clear();
++            window.paint_drop_shadows_transformed(
++                edge,
++                Corners::default(),
++                std::slice::from_ref(&drop),
++                back,
++            );
++            assert_eq!(window.next_frame.scene.shadows.len(), 1);
++        });
++    }
++
+     /// A transformed image keeps its exact bounds (the transformation places it), carries the
+     /// transformation and the element opacity to its sprite, and is culled and ordered by its
+     /// transformed bounds; an untransformed image stays snapped to device pixels.
+diff --git a/crates/gpui_apple/src/shaders.metal b/crates/gpui_apple/src/shaders.metal
+index 108f822..12d2357 100644
+--- a/crates/gpui_apple/src/shaders.metal
++++ b/crates/gpui_apple/src/shaders.metal
+@@ -470,12 +470,15 @@ struct ShadowVertexOutput {
+   float4 color [[flat]];
+   uint shadow_id [[flat]];
+   float clip_distance [[clip_distance]][4];
++  // The point in the shadow's own space (before its transformation).
++  float2 shadow_position;
+ };
+ 
+ struct ShadowFragmentInput {
+   float4 position [[position]];
+   float4 color [[flat]];
+   uint shadow_id [[flat]];
++  float2 shadow_position;
+ };
+ 
+ vertex ShadowVertexOutput shadow_vertex(
+@@ -488,7 +491,7 @@ vertex ShadowVertexOutput shadow_vertex(
+   Shadow shadow = shadows[shadow_id];
+ 
+   Bounds_ScaledPixels bounds;
+-  if (shadow.inset != 0u) {
++  if (shadow.inset == 1u) {
+     bounds = shadow.element_bounds;
+   } else {
+     // Leave room for the gaussian tail outside the shadow rect.
+@@ -500,17 +503,21 @@ vertex ShadowVertexOutput shadow_vertex(
+     bounds.size.height += 2. * margin;
+   }
+ 
+-  float4 device_position =
+-      to_device_position(unit_vertex, bounds, viewport_size);
+-  float4 clip_distance =
+-      distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
++  float4 device_position = to_device_position_transformed(
++      unit_vertex, bounds, shadow.transformation, viewport_size);
++  float4 clip_distance = distance_from_clip_rect_transformed(
++      unit_vertex, bounds, shadow.content_mask.bounds, shadow.transformation);
+   float4 color = hsla_to_rgba(shadow.color);
++  float2 shadow_position =
++      float2(bounds.origin.x, bounds.origin.y) +
++      unit_vertex * float2(bounds.size.width, bounds.size.height);
+ 
+   return ShadowVertexOutput{
+       device_position,
+       color,
+       shadow_id,
+-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
++      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
++      shadow_position};
+ }
+ 
+ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
+@@ -518,11 +525,20 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
+                                 [[buffer(ShadowInputIndex_Shadows)]]) {
+   Shadow shadow = shadows[input.shadow_id];
+ 
++  // A transformed shadow is evaluated in its own space; its hard edges are anti-aliased by
++  // their screen-space gradient (computed here, in uniform control flow).
++  bool transformed = !is_unit_transformation(shadow.transformation);
++  float2 position = input.shadow_position;
++  float transformed_distance =
++      transformed_quad_sdf(position, shadow.bounds, shadow.corner_radii);
++  float transformed_element_distance = transformed_quad_sdf(
++      position, shadow.element_bounds, shadow.element_corner_radii);
++
+   float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
+   float2 size = float2(shadow.bounds.size.width, shadow.bounds.size.height);
+   float2 half_size = size / 2.;
+   float2 center = origin + half_size;
+-  float2 point = input.position.xy - center;
++  float2 point = position - center;
+   float corner_radius;
+   if (point.x < 0.) {
+     if (point.y < 0.) {
+@@ -540,7 +556,9 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
+ 
+   float alpha;
+   if (shadow.blur_radius == 0.) {
+-    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
++    float distance = transformed
++        ? transformed_distance
++        : quad_sdf(position, shadow.bounds, shadow.corner_radii);
+     alpha = saturate(0.5 - distance);
+   } else {
+     // The signal is only non-zero in a limited range, so don't waste samples
+@@ -561,13 +579,24 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
+     }
+   }
+ 
+-  if (shadow.inset != 0u) {
++  float element_distance = transformed
++      ? transformed_element_distance
++      : quad_sdf(position, shadow.element_bounds, shadow.element_corner_radii);
++  if (shadow.inset == 1u) {
+     // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
+     // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
+     alpha = 1. - alpha;
+-    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+-                                      shadow.element_corner_radii);
+     alpha *= saturate(0.5 - element_distance);
++  } else if (shadow.inset == 2u) {
++    // An outer shadow is clipped inside the element, as CSS clips a box-shadow.
++    alpha *= saturate(0.5 + element_distance);
++  }
++  if (shadow.clip_size.width > 0.) {
++    // The shadow clip: a turned rectangle, in pixel units in its own space.
++    float2 p = transform_point(input.position.xy, shadow.clip_transformation);
++    float d = max(max(-p.x, p.x - shadow.clip_size.width),
++                  max(-p.y, p.y - shadow.clip_size.height));
++    alpha *= saturate(0.5 - d);
+   }
+ 
+   return input.color * float4(1., 1., 1., alpha);
+diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
+index 699d437..40b9c0e 100644
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -1019,6 +1019,11 @@ struct Shadow {
+     // 0 = drop shadow, 1 = inset shadow.
+     inset: u32,
+     pad: u32, // align to 8 bytes
++    // Maps the shadow's space to the scene.
++    transformation: TransformationMatrix,
++    // Scene -> the shadow clip's own space; no clip when `clip_size` is empty.
++    clip_transformation: TransformationMatrix,
++    clip_size: vec2<f32>,
+ }
+ 
+ struct ShadowVarying {
+@@ -1027,6 +1032,8 @@ struct ShadowVarying {
+     @location(1) @interpolate(flat) shadow_id: u32,
+     //TODO: use `clip_distance` once Naga supports it
+     @location(3) clip_distances: vec4<f32>,
++    // The point in the shadow's own space (before its transformation).
++    @location(4) shadow_position: vec2<f32>,
+ }
+ 
+ @vertex
+@@ -1035,7 +1042,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
+     var shadow = load_shadow(instance_id);
+ 
+     var geometry: Bounds;
+-    if (shadow.inset != 0u) {
++    if (shadow.inset == 1u) {
+         geometry = shadow.element_bounds;
+     } else {
+         // Leave room for the gaussian tail outside the shadow rect.
+@@ -1046,30 +1053,42 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
+     }
+ 
+     var out = ShadowVarying();
+-    out.position = to_device_position(unit_vertex, geometry);
++    out.position = to_device_position_transformed(unit_vertex, geometry, shadow.transformation);
+     out.color = hsla_to_rgba(shadow.color);
+     out.shadow_id = instance_id;
+-    out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
++    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, geometry, shadow.content_mask, shadow.transformation);
++    out.shadow_position = geometry.origin + unit_vertex * geometry.size;
+     return out;
+ }
+ 
+ @fragment
+ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
+-    // Alpha clip first, since we don't have `clip_distance`.
++    let shadow = load_shadow(input.shadow_id);
++    // A transformed shadow is evaluated in its own space; its hard edges are anti-aliased by
++    // their screen-space gradient (computed before any non-uniform control flow).
++    let transformed = !is_unit_transformation(shadow.transformation);
++    let position = input.shadow_position;
++    let transformed_distance = transformed_quad_sdf(position, shadow.bounds, shadow.corner_radii);
++    let transformed_element_distance = transformed_quad_sdf(position, shadow.element_bounds,
++                                                            shadow.element_corner_radii);
++
++    // Alpha clip after using the derivatives, since we don't have `clip_distance`.
+     if (any(input.clip_distances < vec4<f32>(0.0))) {
+         return vec4<f32>(0.0);
+     }
+ 
+-    let shadow = load_shadow(input.shadow_id);
+     let half_size = shadow.bounds.size / 2.0;
+     let center = shadow.bounds.origin + half_size;
+-    let center_to_point = input.position.xy - center;
++    let center_to_point = position - center;
+ 
+     let corner_radius = pick_corner_radius(center_to_point, shadow.corner_radii);
+ 
+     var alpha: f32;
+     if (shadow.blur_radius == 0.0) {
+-        let distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
++        var distance = quad_sdf(position, shadow.bounds, shadow.corner_radii);
++        if (transformed) {
++            distance = transformed_distance;
++        }
+         alpha = saturate(0.5 - distance);
+     } else {
+         // The signal is only non-zero in a limited range, so don't waste samples
+@@ -1090,13 +1109,26 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
+         }
+     }
+ 
+-    if (shadow.inset != 0u) {
++    var element_distance = quad_sdf(position, shadow.element_bounds,
++                                    shadow.element_corner_radii);
++    if (transformed) {
++        element_distance = transformed_element_distance;
++    }
++    if (shadow.inset == 1u) {
+         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
+         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
+         alpha = 1.0 - alpha;
+-        let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+-                                        shadow.element_corner_radii);
+         alpha *= saturate(0.5 - element_distance);
++    } else if (shadow.inset == 2u) {
++        // An outer shadow is clipped inside the element, as CSS clips a box-shadow.
++        alpha *= saturate(0.5 + element_distance);
++    }
++    if (shadow.clip_size.x > 0.0) {
++        // The shadow clip: a turned rectangle, in pixel units in its own space.
++        let p = transpose(shadow.clip_transformation.rotation_scale) * input.position.xy
++            + shadow.clip_transformation.translation;
++        let d = max(max(-p.x, p.x - shadow.clip_size.x), max(-p.y, p.y - shadow.clip_size.y));
++        alpha *= saturate(0.5 - d);
+     }
+ 
+     return blend_color(input.color, alpha);
+diff --git a/crates/gpui_wgpu/src/shaders_webgl.wgsl b/crates/gpui_wgpu/src/shaders_webgl.wgsl
+index d0494a4..e90df46 100644
+--- a/crates/gpui_wgpu/src/shaders_webgl.wgsl
++++ b/crates/gpui_wgpu/src/shaders_webgl.wgsl
+@@ -191,7 +191,7 @@ fn load_quad(instance_id: u32) -> Quad {
+ }
+ 
+ fn load_shadow(instance_id: u32) -> Shadow {
+-    var cursor = instance_cursor(instance_id * 28u);
++    var cursor = instance_cursor(instance_id * 42u);
+     return Shadow(
+         read_word(&cursor),
+         read_f32(&cursor),
+@@ -203,6 +203,9 @@ fn load_shadow(instance_id: u32) -> Shadow {
+         read_corners(&cursor),
+         read_word(&cursor),
+         read_word(&cursor),
++        read_transformation(&cursor),
++        read_transformation(&cursor),
++        read_vec2_f32(&cursor),
+     );
+ }
+ 
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
+index 9e7bd83..81709b1 100644
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -2300,7 +2300,7 @@ mod tests {
+     #[test]
+     fn webgl_record_sizes_match_shader_word_strides() {
+         assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
+-        assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
++        assert_eq!(std::mem::size_of::<Shadow>(), 42 * 4);
+         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
+         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
+         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
+diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
+index 59a3eb9..93cacbd 100644
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -922,6 +922,11 @@ struct Shadow {
+     Corners element_corner_radii;
+     uint inset;
+     uint pad; // align to 8 bytes
++    // Maps the shadow's space to the scene.
++    TransformationMatrix transformation;
++    // Scene -> the shadow clip's own space; no clip when `clip_size` is empty.
++    TransformationMatrix clip_transformation;
++    float2 clip_size;
+ };
+ 
+ struct ShadowVertexOutput {
+@@ -929,12 +934,15 @@ struct ShadowVertexOutput {
+     float4 position: SV_Position;
+     nointerpolation float4 color: COLOR;
+     float4 clip_distance: SV_ClipDistance;
++    // The point in the shadow's own space (before its transformation).
++    float2 shadow_position: TEXCOORD1;
+ };
+ 
+ struct ShadowFragmentInput {
+   nointerpolation uint shadow_id: TEXCOORD0;
+   float4 position: SV_Position;
+   nointerpolation float4 color: COLOR;
++  float2 shadow_position: TEXCOORD1;
+ };
+ 
+ StructuredBuffer<Shadow> shadows: register(t1);
+@@ -945,7 +953,7 @@ ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint instance_id:
+     Shadow shadow = shadows[shadow_id];
+ 
+     Bounds bounds;
+-    if (shadow.inset != 0u) {
++    if (shadow.inset == 1u) {
+         bounds = shadow.element_bounds;
+     } else {
+         // Leave room for the gaussian tail outside the shadow rect.
+@@ -955,8 +963,8 @@ ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint instance_id:
+         bounds.size += 2.0 * margin;
+     }
+ 
+-    float4 device_position = to_device_position(unit_vertex, bounds);
+-    float4 clip_distance = distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask);
++    float4 device_position = to_device_position_transformed(unit_vertex, bounds, shadow.transformation);
++    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, bounds, shadow.content_mask, shadow.transformation);
+     float4 color = hsla_to_rgba(shadow.color);
+ 
+     ShadowVertexOutput output;
+@@ -964,6 +972,7 @@ ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint instance_id:
+     output.color = color;
+     output.shadow_id = shadow_id;
+     output.clip_distance = clip_distance;
++    output.shadow_position = bounds.origin + unit_vertex * bounds.size;
+ 
+     return output;
+ }
+@@ -971,14 +980,24 @@ ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint instance_id:
+ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
+     Shadow shadow = shadows[input.shadow_id];
+ 
++    // A transformed shadow is evaluated in its own space; its hard edges are anti-aliased by
++    // their screen-space gradient (computed here, in uniform control flow).
++    bool transformed = !is_unit_transformation(shadow.transformation);
++    float2 position = input.shadow_position;
++    float transformed_distance = transformed_quad_sdf(position, shadow.bounds, shadow.corner_radii);
++    float transformed_element_distance = transformed_quad_sdf(position, shadow.element_bounds,
++                                                              shadow.element_corner_radii);
++
+     float2 half_size = shadow.bounds.size / 2.;
+     float2 center = shadow.bounds.origin + half_size;
+-    float2 point0 = input.position.xy - center;
++    float2 point0 = position - center;
+     float corner_radius = pick_corner_radius(point0, shadow.corner_radii);
+ 
+     float alpha;
+     if (shadow.blur_radius == 0.) {
+-        float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
++        float distance = transformed
++            ? transformed_distance
++            : quad_sdf(position, shadow.bounds, shadow.corner_radii);
+         alpha = saturate(0.5 - distance);
+     } else {
+         // The signal is only non-zero in a limited range, so don't waste samples
+@@ -999,13 +1018,24 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
+         }
+     }
+ 
+-    if (shadow.inset != 0u) {
++    float element_distance = transformed
++        ? transformed_element_distance
++        : quad_sdf(position, shadow.element_bounds, shadow.element_corner_radii);
++    if (shadow.inset == 1u) {
+         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
+         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
+         alpha = 1.0 - alpha;
+-        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+-                                          shadow.element_corner_radii);
+         alpha *= saturate(0.5 - element_distance);
++    } else if (shadow.inset == 2u) {
++        // An outer shadow is clipped inside the element, as CSS clips a box-shadow.
++        alpha *= saturate(0.5 + element_distance);
++    }
++    if (shadow.clip_size.x > 0.) {
++        // The shadow clip: a turned rectangle, in pixel units in its own space.
++        float2 p = mul(input.position.xy, shadow.clip_transformation.rotation_scale)
++            + shadow.clip_transformation.translation;
++        float d = max(max(-p.x, p.x - shadow.clip_size.x), max(-p.y, p.y - shadow.clip_size.y));
++        alpha *= saturate(0.5 - d);
+     }
+ 
+     return input.color * float4(1., 1., 1., alpha);
